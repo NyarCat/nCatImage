@@ -3,7 +3,6 @@ use std::{
     collections::VecDeque,
     fs::{self, OpenOptions},
     io::{self, Write},
-    os::unix::fs::{DirBuilderExt, OpenOptionsExt},
     path::{Path, PathBuf},
     time::{Instant, SystemTime, UNIX_EPOCH},
 };
@@ -144,7 +143,18 @@ impl Diagnostics {
         }
     }
     fn write_snapshot(&mut self) -> io::Result<()> {
-        match fs::DirBuilder::new().mode(0o700).create(&self.directory) {
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut builder = fs::DirBuilder::new();
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        // Windows: files inherit the directory ACL, which is per-user under the profile.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+            builder.mode(0o700);
+            options.mode(0o600);
+        }
+        match builder.create(&self.directory) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
             Err(error) => return Err(error),
@@ -175,11 +185,7 @@ impl Diagnostics {
             std::process::id(),
             self.sequence
         );
-        let mut file = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(self.directory.join(name))?;
+        let mut file = options.open(self.directory.join(name))?;
         writeln!(
             file,
             "ncat-diagnostics-v1 unix_ns={timestamp} pid={} backend_version={} retention_files={MAX_FILES}",
@@ -213,7 +219,6 @@ fn managed_name(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{PermissionsExt, symlink};
     #[test]
     fn drop_snapshots_contain_stages_without_source_data() {
         let root = tempfile::tempdir().unwrap();
@@ -268,15 +273,21 @@ mod tests {
         assert!(text.contains("generation=199"));
         assert!(!text.contains("generation=0\n"));
         assert!(text.len() <= (HISTORY_LINES + 1) * (MAX_LINE_BYTES + 1));
-        assert_eq!(
-            fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
         assert!(directory.join("user-notes.txt").exists());
         assert!(directory.join("ncat-incident-custom.log").exists());
     }
+    #[cfg(unix)]
     #[test]
     fn rejects_symlink_directory_and_log_failure_is_nonfatal() {
+        use std::os::unix::fs::symlink;
         let root = tempfile::tempdir().unwrap();
         let target = root.path().join("target");
         fs::create_dir(&target).unwrap();

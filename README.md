@@ -2,7 +2,7 @@
 
 **가볍게 열고, 빠르게 넘기는 Rust 기반 로컬 코믹뷰어.**
 
-폴더와 ZIP/CBZ를 바로 열어 이미지를 감상하는 Linux용 뷰어입니다. 로컬 파일과 OS가 연결하는 SMB·FTP·SFTP 네트워크 폴더를 읽을 수 있습니다. 원본 파일을 변경하지 않으며, 자동 원격 분석이나 감상 기록 저장 없이 동작합니다.
+폴더와 ZIP/CBZ를 바로 열어 이미지를 감상하는 Linux·Windows용 뷰어입니다. 로컬 파일과 OS가 연결하는 SMB·FTP·SFTP 네트워크 폴더를 읽을 수 있습니다. 원본 파일을 변경하지 않으며, 자동 원격 분석이나 감상 기록 저장 없이 동작합니다.
 
 > **v0.4.3 · 개발 프리뷰** — 아직 MVP/정식 안정판이 아닙니다. 지원 형식과 아래 제한 사항을 확인해 주세요.
 
@@ -20,6 +20,8 @@
 
 ## 다운로드 및 실행
 
+### Linux
+
 [**Linux x86_64 AppImage 다운로드**](https://github.com/NyarCat/nCatImage/releases/tag/v0.4.3)
 
 GTK와 이미지 처리 worker를 포함한 **AppImage 파일 하나**로 배포합니다. Rust나 GTK 개발 패키지를 따로 설치할 필요가 없습니다.
@@ -31,7 +33,7 @@ chmod +x nCatImage-0.4.3-x86_64.AppImage
 ```
 
 - 대상: **Linux x86_64, glibc 2.39 이상**(Ubuntu 24.04 및 동급 이상 환경).
-- X11 또는 Wayland 그래픽 세션과 시스템 그래픽·폰트 환경이 필요합니다. Windows/macOS, ARM64, musl 기반 Alpine은 지원 대상이 아닙니다.
+- X11 또는 Wayland 그래픽 세션과 시스템 그래픽·폰트 환경이 필요합니다. macOS, ARM64, musl 기반 Alpine은 지원 대상이 아닙니다.
 - 호환성을 위해 배포본은 기본적으로 Cairo 소프트웨어 렌더러를 사용합니다. `GSK_RENDERER`를 지정하면 변경할 수 있습니다.
 - 모든 배포판·GPU·입력기 조합에서 검증된 것은 아닙니다. AppImage가 모든 Linux에서 실행된다는 뜻은 아닙니다.
 - 외부 fcitx/IBus 모듈은 포함하지 않습니다. 시스템 입력기 설정에 따라 경고나 한글 입력 문제가 있을 수 있으며 별도 검증이 필요합니다.
@@ -48,13 +50,34 @@ FUSE 관련 오류가 나면 설치 없이 압축 해제 실행을 시도하세�
 sha256sum -c SHA256SUMS
 ```
 
+### Windows
+
+[릴리스 페이지](https://github.com/NyarCat/nCatImage/releases)에서 둘 중 하나를 받으세요. 두 파일 모두 GTK 런타임과 worker를 포함하므로 GTK나 Visual C++ 재배포 패키지를 따로 설치할 필요가 없습니다.
+
+| 파일 | 설명 |
+|---|---|
+| `nCatImage-<버전>-windows-x86_64-setup.exe` | 설치 프로그램. 기본은 관리자 권한 없는 사용자별 설치입니다. 시작 메뉴 바로가기, 제거 프로그램, 이미지·ZIP/CBZ의 “연결 프로그램” 항목, 선택 항목인 폴더 우클릭 “nCatImage로 열기”를 추가합니다. 기존 기본 앱은 바꾸지 않습니다. |
+| `nCatImage-<버전>-windows-x86_64.zip` | 포터블. 압축을 풀고 `nCatImage\nCatImage.exe`를 실행합니다. 폴더 안의 파일 구성을 그대로 유지해야 합니다. |
+
+```powershell
+nCatImage.exe C:\path\to\book.cbz
+```
+
+- 대상: **Windows 10/11 x64**.
+- 코드 서명이 없어 처음 실행할 때 SmartScreen 경고가 나올 수 있습니다.
+- GTK 기본 렌더러를 사용합니다. 그래픽 문제가 있으면 환경변수 `GSK_RENDERER=cairo`로 소프트웨어 렌더러를 쓸 수 있습니다.
+- worker에는 Windows 작업 개체(job object)로 프로세스당 메모리 상한(1GiB), 하위 프로세스 생성 금지, GUI 종료 시 함께 종료가 적용됩니다. Linux와 마찬가지로 파일시스템·네트워크 샌드박스는 아닙니다.
+- Windows 빌드는 Linux보다 검증 범위가 좁습니다.
+
+무결성은 PowerShell의 `Get-FileHash <파일>` 결과를 `SHA256SUMS-windows`와 비교해 확인할 수 있습니다.
+
 ## 주요 기능
 
 - 이미지 파일, 폴더, ZIP/CBZ 열기와 파일 드래그 앤 드롭
 - OS 연결 도구를 통한 SMB·FTP·SFTP 파일/폴더 열기
 - 자연 정렬, 이전/다음 페이지 및 페이지 번호 이동
 - JPEG, PNG, BMP, WebP, GIF 첫 프레임 표시
-- EXIF 방향 적용, 임시 회전, 맞춤, 확대, 스크롤·드래그 패닝, 전체 화면
+- EXIF 방향 적용, 임시 회전, 맞춤, 채우기(비율 유지하며 창 크기까지 확대), 확대, 스크롤·드래그 패닝, 전체 화면
 - 좌우 읽기 방향 전환
 - 별도 worker 프로세스에서 이미지 처리, 오래된 요청 취소
 - 바이트 제한 페이지 캐시와 인접 페이지 미리 읽기
@@ -77,6 +100,7 @@ RAR/CBR·7Z, 두 장 보기 UI, 이어보기, 썸네일, ICC 색관리, 애니�
 | 읽기 방향에 따른 페이지 이동 | `←` / `→` |
 | 읽기 방향 전환 | `D` |
 | 확대 / 축소 / 맞춤 | `+` / `-` / `9` |
+| 채우기 켜기 | `0` (맞춤 `9`로 해제) |
 | 회전 / 반대 회전 | `R` / `Shift+R` |
 | 다시 열기 | `F5` |
 | 상단 UI 표시 / 숨김 | 백틱(<kbd>&#96;</kbd>), 일반 창에서만 |
@@ -105,6 +129,8 @@ RAR/CBR·7Z, 두 장 보기 UI, 이어보기, 썸네일, ICC 색관리, 애니�
 
 ## 소스 빌드
 
+### Linux
+
 저장소의 `rust-toolchain.toml`에 지정된 Rust와 GTK **4.10 이상** 개발 패키지가 필요합니다. Ubuntu 24.04에서는 다음과 같이 빌드합니다:
 
 ```bash
@@ -116,6 +142,32 @@ cargo build --workspace --release --locked
 `ncat-linux`와 `ncat-worker`는 같은 디렉터리에 두세요. GUI만 빌드하면 worker가 누락될 수 있으므로 workspace 전체를 빌드해야 합니다.
 
 AppImage 생성 방법과 필요한 추가 패키지는 [`packaging/linux/build-appimage.sh`](packaging/linux/build-appimage.sh)에 있습니다. 배포용 빌드는 최신 개발 머신이 아닌 Ubuntu 24.04 기준 환경에서 만드세요.
+
+### Windows
+
+Windows 10/11 x64에서 다음이 필요합니다.
+
+- `rust-toolchain.toml`에 지정된 Rust(`x86_64-pc-windows-msvc`)
+- Visual Studio 2022 이상 또는 Build Tools의 “C++를 사용한 데스크톱 개발”(MSVC, Windows SDK)
+- [gvsbuild](https://github.com/wingtk/gvsbuild/releases)의 `GTK4_Gvsbuild_<버전>_x64.zip`을 `target\gtk`에 압축 해제. 다른 위치는 `GTK_DIR` 환경변수나 `-GtkDir`로 지정합니다. 2026.10.0(GTK 4.24.1)으로 검증했습니다.
+- 설치 프로그램을 만들 때 Inno Setup 6(`winget install JRSoftware.InnoSetup`)
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\windows\build-windows.ps1
+```
+
+이 스크립트는 workspace를 빌드하고 GTK DLL·MSVC 런타임·리소스를 포함한 앱 폴더를 `target\windows\nCatImage`에 만듭니다. 이어서 Windows 기본 경로만으로 smoke test를 실행한 뒤 `dist\`에 포터블 ZIP, 설치 프로그램, `SHA256SUMS-windows`를 만듭니다. 설치 프로그램이 필요 없으면 `-SkipInstaller`를 붙이세요.
+
+개발 중에 직접 빌드·실행하려면 pkg-config와 GTK `bin`을 지정합니다:
+
+```powershell
+$env:PKG_CONFIG = "$PWD\target\gtk\bin\pkg-config.exe"
+$env:PKG_CONFIG_PATH = "$PWD\target\gtk\lib\pkgconfig"
+$env:LIB = "$PWD\target\gtk\lib;$env:LIB"
+$env:PATH = "$PWD\target\gtk\bin;$env:PATH"
+cargo build --workspace --release --locked
+.\target\release\ncat-linux.exe C:\path\to\book.cbz
+```
 
 ## 실행 설정 및 오류 보고
 
@@ -137,4 +189,4 @@ AppImage 생성 방법과 필요한 추가 패키지는 [`packaging/linux/build-
 
 ## 개발 상태
 
-Linux x86_64부터 개발 중인 개인 프로젝트입니다. 정식 코덱 호환성·보안·성능 검증이 완료된 제품이 아니며, 다른 뷰어보다 가볍다는 비교 결과를 주장하지 않습니다. 코드 라이선스는 아직 미정입니다. 배포본에 포함된 외부 구성요소의 라이선스 고지는 AppImage 내부 `usr/share/doc/ncatimage/`에 있습니다.
+Linux·Windows x86_64용으로 개발 중인 개인 프로젝트입니다. 정식 코덱 호환성·보안·성능 검증이 완료된 제품이 아니며, 다른 뷰어보다 가볍다는 비교 결과를 주장하지 않습니다. 코드 라이선스는 아직 미정입니다. 배포본에 포함된 외부 구성요소의 라이선스 고지는 AppImage 내부 `usr/share/doc/ncatimage/`와 Windows 배포본의 `doc\third-party\`에 있습니다.

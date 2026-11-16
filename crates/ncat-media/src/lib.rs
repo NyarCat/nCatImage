@@ -10,7 +10,6 @@ use ncat_protocol::{
 use std::cell::RefCell;
 use std::fs::{self, File};
 use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
-use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
@@ -75,12 +74,13 @@ impl Revision {
         if !m.is_file() {
             return Err(Error::Unsupported);
         }
+        let stamp = ncat_core::FileStamp::of(m);
         Ok(Self {
-            dev: m.dev(),
-            ino: m.ino(),
+            dev: stamp.device,
+            ino: stamp.inode,
             len: m.len(),
-            mtime: (m.mtime(), m.mtime_nsec()),
-            ctime: (m.ctime(), m.ctime_nsec()),
+            mtime: stamp.modified,
+            ctime: stamp.changed,
         })
     }
 }
@@ -121,6 +121,21 @@ fn label(bytes: &[u8]) -> String {
         .collect()
 }
 
+/// ZIP entry names carry no reliable charset: only flagged names are UTF-8, and Korean
+/// or Japanese Windows tools write unflagged CP949/Shift_JIS. Flagged names are always
+/// valid UTF-8 and legacy multibyte names almost never are, so try UTF-8 first.
+fn entry_label(raw: &[u8]) -> String {
+    if std::str::from_utf8(raw).is_ok() {
+        return label(raw);
+    }
+    for encoding in [encoding_rs::EUC_KR, encoding_rs::SHIFT_JIS] {
+        if let Some(name) = encoding.decode_without_bom_handling_and_without_replacement(raw) {
+            return label(name.as_bytes());
+        }
+    }
+    label(raw)
+}
+
 fn checked_catalog(pages: &[Page]) -> Result<(), Error> {
     let cost: u64 = pages.iter().map(Page::cost).sum();
     if pages.len() > MAX_ENTRIES || cost > INDEX_BYTES / 2 {
@@ -131,7 +146,7 @@ fn checked_catalog(pages: &[Page]) -> Result<(), Error> {
 
 impl Book {
     pub fn open(path: &Path) -> Result<Self, Error> {
-        if path.as_os_str().as_bytes().len() > ncat_protocol::MAX_PATH_BYTES {
+        if path.as_os_str().as_encoded_bytes().len() > ncat_protocol::MAX_PATH_BYTES {
             return Err(Error::Limit);
         }
         let meta = fs::metadata(path).map_err(|_| Error::Io)?;
@@ -143,7 +158,11 @@ impl Book {
                 },
                 pages: Vec::new(),
                 selected: 0,
-                title: label(path.file_name().unwrap_or(path.as_os_str()).as_bytes()),
+                title: label(
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .as_encoded_bytes(),
+                ),
                 deferred: false,
             };
             book.catalog()?;
@@ -167,7 +186,11 @@ impl Book {
                 },
                 pages: Vec::new(),
                 selected: 0,
-                title: label(path.file_name().unwrap_or(path.as_os_str()).as_bytes()),
+                title: label(
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .as_encoded_bytes(),
+                ),
                 deferred: false,
             };
             book.catalog()?;
@@ -180,6 +203,12 @@ impl Book {
             .parent()
             .filter(|p| !p.as_os_str().is_empty())
             .unwrap_or(Path::new("."));
+        // Spell the initial page exactly as the folder scan will (`root.join(name)`), so
+        // that `a.png` vs `./a.png`, or `C:/x/a.png` vs `C:/x\a.png`, is not listed twice.
+        let path = &match path.file_name() {
+            Some(name) => root.join(name),
+            None => path.to_path_buf(),
+        };
         Ok(Self {
             source: Source::Folder {
                 root: root.into(),
@@ -187,10 +216,18 @@ impl Book {
             },
             pages: vec![Page {
                 key: PageKey::File(RawPath::new(path)),
-                name: label(path.file_name().unwrap_or(path.as_os_str()).as_bytes()),
+                name: label(
+                    path.file_name()
+                        .unwrap_or(path.as_os_str())
+                        .as_encoded_bytes(),
+                ),
             }],
             selected: 0,
-            title: label(root.file_name().unwrap_or(root.as_os_str()).as_bytes()),
+            title: label(
+                root.file_name()
+                    .unwrap_or(root.as_os_str())
+                    .as_encoded_bytes(),
+            ),
             deferred: true,
         })
     }
@@ -204,13 +241,13 @@ impl Book {
                     let entry = entry.map_err(|_| Error::Io)?;
                     let name = entry.file_name();
                     if !entry.file_type().map_err(|_| Error::Io)?.is_file()
-                        || !image_hint(name.as_bytes())
+                        || !image_hint(name.as_encoded_bytes())
                     {
                         continue;
                     }
                     let page = Page {
                         key: PageKey::File(RawPath::new(&entry.path())),
-                        name: label(name.as_bytes()),
+                        name: label(name.as_encoded_bytes()),
                     };
                     cost = cost.checked_add(page.cost()).ok_or(Error::Limit)?;
                     if pages.len() >= MAX_ENTRIES || cost > INDEX_BYTES / 2 {
@@ -227,7 +264,7 @@ impl Book {
                                 initial
                                     .file_name()
                                     .unwrap_or(initial.as_os_str())
-                                    .as_bytes(),
+                                    .as_encoded_bytes(),
                             ),
                         });
                     }
@@ -283,7 +320,7 @@ impl Book {
                     }
                     let page = Page {
                         key: PageKey::Zip(i as u64),
-                        name: label(raw),
+                        name: entry_label(raw),
                     };
                     cost = cost
                         .checked_add(page.cost() + raw.len() as u64 * 2)
@@ -455,13 +492,7 @@ impl Book {
         if Revision::path(&source_path)? != revision {
             return Err(Error::Changed);
         }
-        let fd = rustix::fs::open(
-            output,
-            rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::TRUNC | rustix::fs::OFlags::NOFOLLOW,
-            rustix::fs::Mode::empty(),
-        )
-        .map_err(|_| Error::Io)?;
-        let mut out = File::from(fd);
+        let mut out = open_output(output).map_err(|_| Error::Io)?;
         if !out.metadata().map_err(|_| Error::Io)?.is_file() {
             return Err(Error::Protocol);
         }
@@ -478,6 +509,29 @@ impl Book {
             elapsed_us: start.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
         })
     }
+}
+
+/// Open the coordinator-created frame file for writing, never creating it and never
+/// following a final symlink. The caller still checks that it opened a regular file.
+#[cfg(unix)]
+fn open_output(output: &Path) -> io::Result<File> {
+    let fd = rustix::fs::open(
+        output,
+        rustix::fs::OFlags::WRONLY | rustix::fs::OFlags::TRUNC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    )?;
+    Ok(File::from(fd))
+}
+#[cfg(windows)]
+fn open_output(output: &Path) -> io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // A reparse point (symlink/junction) is opened as itself and then fails is_file().
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    fs::OpenOptions::new()
+        .write(true)
+        .truncate(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(output)
 }
 
 #[cfg(test)]
@@ -499,6 +553,16 @@ mod tests {
     fn control_characters_are_not_displayed() {
         assert_eq!(label(b"p\n1.png"), "p1.png");
         assert!(!label("a\u{202e}jpg".as_bytes()).contains('\u{202e}'));
+    }
+    #[test]
+    fn legacy_zip_entry_names_are_decoded() {
+        // "만화/가나.png" as written by Korean Windows archivers (CP949, no UTF-8 flag).
+        let cp949 = b"\xb8\xb8\xc8\xad/\xb0\xa1\xb3\xaa.png";
+        assert_eq!(entry_label(cp949), "만화/가나.png");
+        assert_eq!(entry_label("만화/가나.png".as_bytes()), "만화/가나.png");
+        // "ソ.png" in Shift_JIS has a trail byte CP949 rejects.
+        assert_eq!(entry_label(b"\x83\x5c.png"), "ソ.png");
+        assert_eq!(entry_label(b"\xff\xff.png"), "\u{fffd}\u{fffd}.png");
     }
     #[test]
     fn folder_natural_order_and_non_utf8_identity() {

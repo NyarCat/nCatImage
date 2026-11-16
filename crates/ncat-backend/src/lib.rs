@@ -370,16 +370,38 @@ struct Worker {
     next_id: u64,
     source: Option<RawPath>,
     index_permit: Option<Arc<Permit>>,
+    /// Closing this handle kills the worker; declared last so it outlives `child`.
+    #[cfg(windows)]
+    _job: ncat_windows::WorkerJob,
 }
 
 impl Worker {
     fn spawn(path: &Path) -> Result<Self, ErrorCode> {
-        let mut child = Command::new(path)
+        let mut command = Command::new(path);
+        command
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .map_err(|_| ErrorCode::Worker)?;
+            .stderr(Stdio::null());
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            // The GUI has no console; never let the worker open one.
+            const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+            command.creation_flags(CREATE_NO_WINDOW);
+        }
+        let mut child = command.spawn().map_err(|_| ErrorCode::Worker)?;
+        // Contain the worker before it receives any request; fail closed like the Unix
+        // worker does when it cannot apply its own limits.
+        #[cfg(windows)]
+        let job =
+            match ncat_windows::WorkerJob::contain(&child, ncat_protocol::WORKER_ADDRESS_SPACE) {
+                Ok(job) => job,
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(ErrorCode::Worker);
+                }
+            };
         let input = BufWriter::new(child.stdin.take().ok_or(ErrorCode::Worker)?);
         let stdout = child.stdout.take().ok_or(ErrorCode::Worker)?;
         let (tx, responses) = mpsc::sync_channel(2);
@@ -432,6 +454,8 @@ impl Worker {
             next_id: 0,
             source: None,
             index_permit: None,
+            #[cfg(windows)]
+            _job: job,
         })
     }
 
@@ -1202,7 +1226,7 @@ pub fn worker_path() -> io::Result<PathBuf> {
     Ok(std::env::current_exe()?
         .parent()
         .ok_or_else(|| io::Error::other("executable directory"))?
-        .join("ncat-worker"))
+        .join(format!("ncat-worker{}", std::env::consts::EXE_SUFFIX)))
 }
 
 #[cfg(test)]

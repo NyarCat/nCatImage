@@ -155,6 +155,40 @@ pub fn physical_next(direction: Direction, right_key: bool) -> bool {
     (direction == Direction::LeftToRight) == right_key
 }
 
+/// File identity and change stamps used to detect a replaced or rewritten source.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FileStamp {
+    pub device: u64,
+    pub inode: u64,
+    pub modified: (i64, i64),
+    pub changed: (i64, i64),
+}
+impl FileStamp {
+    #[cfg(unix)]
+    pub fn of(m: &std::fs::Metadata) -> Self {
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            device: m.dev(),
+            inode: m.ino(),
+            modified: (m.mtime(), m.mtime_nsec()),
+            changed: (m.ctime(), m.ctime_nsec()),
+        }
+    }
+    /// Stable std exposes no file ID on Windows, so identity is left zero. Size plus the
+    /// 100ns write and creation times still catch in-place rewrites and most replacements;
+    /// creation time stands in for ctime.
+    #[cfg(windows)]
+    pub fn of(m: &std::fs::Metadata) -> Self {
+        use std::os::windows::fs::MetadataExt;
+        Self {
+            device: 0,
+            inode: 0,
+            modified: (m.last_write_time() as i64, 0),
+            changed: (m.creation_time() as i64, 0),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

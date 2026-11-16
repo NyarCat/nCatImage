@@ -1,4 +1,6 @@
 #![forbid(unsafe_code)]
+// Release builds are GUI-only on Windows (no console); debug builds keep stderr visible.
+#![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
 mod network;
 
@@ -15,6 +17,17 @@ use std::time::Duration;
 
 fn interface_shown(enabled: bool, fullscreen: bool) -> bool {
     enabled && !fullscreen
+}
+
+/// Largest size with the image's aspect ratio that fits the area, enlarging small images.
+fn contain_size(width: u32, height: u32, area_width: u32, area_height: u32) -> (u32, u32) {
+    let (width, height) = (width.max(1), height.max(1));
+    let scale = (f64::from(area_width.max(1)) / f64::from(width))
+        .min(f64::from(area_height.max(1)) / f64::from(height));
+    (
+        (f64::from(width) * scale).floor().max(1.0) as u32,
+        (f64::from(height) * scale).floor().max(1.0) as u32,
+    )
 }
 
 fn page_step(key: gdk::Key) -> Option<bool> {
@@ -50,6 +63,9 @@ struct Ui {
     previous: gtk::Button,
     next: gtk::Button,
     direction_button: gtk::ToggleButton,
+    /// 채우기 mode: enlarge to the viewer size keeping the aspect ratio. Persists across pages.
+    fill_button: gtk::ToggleButton,
+    fill: Cell<bool>,
     backend: Backend,
     book: RefCell<Option<Arc<Book>>>,
     selected: Cell<usize>,
@@ -354,16 +370,24 @@ impl Ui {
             self.scroll
                 .set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
             self.picture.set_size_request(-1, -1);
-            self.picture.set_content_fit(gtk::ContentFit::ScaleDown);
+            // Contain also enlarges a texture smaller than the viewer; ScaleDown never does.
+            self.picture.set_content_fit(if self.fill.get() {
+                gtk::ContentFit::Contain
+            } else {
+                gtk::ContentFit::ScaleDown
+            });
         } else {
             let (w, h) = self.original.get();
-            let (w, h) = fit_size(
-                w.max(1),
-                h.max(1),
+            let (area_w, area_h) = (
                 self.scroll.width().max(1) as u32,
                 self.scroll.height().max(1) as u32,
-            )
-            .unwrap_or((1, 1));
+            );
+            // Zoom steps start from whatever size the current mode shows at 100%.
+            let (w, h) = if self.fill.get() {
+                contain_size(w, h, area_w, area_h)
+            } else {
+                fit_size(w.max(1), h.max(1), area_w, area_h).unwrap_or((1, 1))
+            };
             self.scroll
                 .set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
             self.picture.set_size_request(
@@ -371,6 +395,16 @@ impl Ui {
                 (f64::from(h) * self.zoom.get()) as i32,
             );
             self.picture.set_content_fit(gtk::ContentFit::Contain);
+        }
+    }
+
+    /// Select 맞춤 (`false`) or 채우기 (`true`) and return to 100% of that mode.
+    fn set_fill(self: &Rc<Self>, fill: bool) {
+        if self.fill_button.is_active() == fill {
+            self.change_zoom(0.0);
+        } else {
+            // The toggled handler applies the mode and resets zoom.
+            self.fill_button.set_active(fill);
         }
     }
 
@@ -558,6 +592,7 @@ impl Ui {
                             self.backend.cache_stats()
                         );
                     }
+                    println!("smoke_title={}", self.window.title().unwrap_or_default());
                     self.smoke_ok.set(true);
                     let weak = Rc::downgrade(self);
                     let hold = if self.smoke_steps.get().is_some() {
@@ -709,6 +744,9 @@ fn build(
     position.set_width_chars(6);
     let smaller = gtk::Button::with_label("−");
     let fit = gtk::Button::with_label("맞춤");
+    fit.set_tooltip_text(Some("원본 크기까지만 창에 맞춤 · 9"));
+    let fill = gtk::ToggleButton::with_label("채우기");
+    fill.set_tooltip_text(Some("비율을 유지하며 창 크기까지 확대 · 0"));
     let larger = gtk::Button::with_label("+");
     let rotate = gtk::Button::with_label("회전");
     for widget in [
@@ -717,6 +755,7 @@ fn build(
         next.upcast_ref(),
         smaller.upcast_ref(),
         fit.upcast_ref(),
+        fill.upcast_ref(),
         larger.upcast_ref(),
         rotate.upcast_ref(),
     ] {
@@ -743,6 +782,8 @@ fn build(
         previous,
         next,
         direction_button: direction,
+        fill_button: fill,
+        fill: Cell::new(false),
         backend,
         book: RefCell::new(None),
         selected: Cell::new(0),
@@ -868,6 +909,16 @@ fn build(
         let weak = Rc::downgrade(&ui);
         fit.connect_clicked(move |_| {
             if let Some(ui) = weak.upgrade() {
+                ui.set_fill(false);
+            }
+        });
+    }
+    {
+        let weak = Rc::downgrade(&ui);
+        ui.fill_button.connect_toggled(move |button| {
+            if let Some(ui) = weak.upgrade() {
+                ui.fill.set(button.is_active());
+                ui.layout_picture();
                 ui.change_zoom(0.0);
             }
         });
@@ -968,7 +1019,8 @@ fn build(
                 }
                 gdk::Key::plus | gdk::Key::equal => ui.change_zoom(1.25),
                 gdk::Key::minus => ui.change_zoom(1.0 / 1.25),
-                gdk::Key::_9 => ui.change_zoom(0.0),
+                gdk::Key::_9 | gdk::Key::KP_9 => ui.set_fill(false),
+                gdk::Key::_0 | gdk::Key::KP_0 => ui.set_fill(true),
                 gdk::Key::r | gdk::Key::R => {
                     ui.rotate(modifiers.contains(gdk::ModifierType::SHIFT_MASK))
                 }
@@ -1305,6 +1357,17 @@ mod tests {
     fn fullscreen_always_hides_interface() {
         assert!(!interface_shown(true, true));
         assert!(!interface_shown(false, true));
+    }
+
+    #[test]
+    fn fill_enlarges_small_images_and_keeps_aspect_ratio() {
+        // Small portrait page in a landscape viewer: height-limited, enlarged 2x.
+        assert_eq!(contain_size(400, 600, 1600, 1200), (800, 1200));
+        // Large landscape image: width-limited, reduced.
+        assert_eq!(contain_size(4000, 1000, 1600, 1200), (1600, 400));
+        // Same aspect ratio fills the viewer exactly.
+        assert_eq!(contain_size(800, 600, 1600, 1200), (1600, 1200));
+        assert_eq!(contain_size(0, 0, 0, 0), (1, 1));
     }
 
     #[test]

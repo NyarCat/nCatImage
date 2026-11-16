@@ -115,6 +115,7 @@ fn run() -> io::Result<()> {
 }
 
 // Resource containment, not a filesystem/network sandbox. Never raise inherited limits.
+#[cfg(unix)]
 fn protect() -> Result<(), rustix::io::Errno> {
     use rustix::process::{self, Pid, Resource, Rlimit, Signal};
     let parent = process::getppid()
@@ -142,6 +143,14 @@ fn protect() -> Result<(), rustix::io::Errno> {
     if process::getppid() != Some(parent) {
         return Err(rustix::io::Errno::PERM);
     }
+    Ok(())
+}
+
+// On Windows the coordinator places this process in a job object right after spawning it
+// (memory cap, no child processes, killed with the GUI) before sending any request; see
+// `ncat_windows::WorkerJob`. A process cannot safely impose that on itself here.
+#[cfg(windows)]
+fn protect() -> Result<(), ()> {
     Ok(())
 }
 

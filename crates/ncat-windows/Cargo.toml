@@ -1,0 +1,11 @@
+[package]
+name = "ncat-windows"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+
+# The only crate allowed to contain `unsafe`: a minimal Win32 FFI surface used by the
+# coordinator to contain the worker. It is an empty library on other platforms.
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true

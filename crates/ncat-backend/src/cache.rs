@@ -4,7 +4,6 @@ use ncat_core::{Budget, Permit};
 use ncat_protocol::{ErrorCode, PageKey};
 use std::collections::VecDeque;
 use std::fs;
-use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -32,12 +31,13 @@ impl Revision {
         if !m.is_file() {
             return Err(ErrorCode::Unsupported);
         }
+        let stamp = ncat_core::FileStamp::of(&m);
         Ok(Self {
-            device: m.dev(),
-            inode: m.ino(),
+            device: stamp.device,
+            inode: stamp.inode,
             size: m.len(),
-            modified: (m.mtime(), m.mtime_nsec()),
-            changed: (m.ctime(), m.ctime_nsec()),
+            modified: stamp.modified,
+            changed: stamp.changed,
         })
     }
 }

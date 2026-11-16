@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/ncat-core", "crates/ncat-protocol", "crates/ncat-media", "crates/ncat-worker", "crates/ncat-backend", "crates/ncat-linux"]
+members = ["crates/ncat-core", "crates/ncat-protocol", "crates/ncat-media", "crates/ncat-worker", "crates/ncat-backend", "crates/ncat-linux", "crates/ncat-windows"]
 
 [workspace.package]
 version = "0.4.3"
@@ -13,13 +13,16 @@ ncat-core = { path = "crates/ncat-core" }
 ncat-protocol = { path = "crates/ncat-protocol" }
 ncat-media = { path = "crates/ncat-media" }
 ncat-backend = { path = "crates/ncat-backend" }
+ncat-windows = { path = "crates/ncat-windows" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "bmp"] }
 zip = { version = "9.6.0", default-features = false, features = ["deflate-flate2-zlib-rs"] }
+encoding_rs = "0.8.44"
 tempfile = "3.27"
 rustix = { version = "1.1.6", features = ["fs", "process", "thread"] }
 async-channel = "2.5"
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_System_JobObjects", "Win32_System_SystemServices", "Win32_System_Threading"] }
 gtk = { package = "gtk4", version = "0.11.5", default-features = false, features = ["v4_10"] }
 
 [profile.release]
