@@ -1341,6 +1341,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn drop_preserves_non_utf8_local_paths() {
         use std::os::unix::ffi::OsStringExt;
         let path = PathBuf::from(std::ffi::OsString::from_vec(b"/not-read/\xff.png".to_vec()));

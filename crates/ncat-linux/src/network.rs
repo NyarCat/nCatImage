@@ -201,6 +201,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn preserves_local_non_utf8_paths() {
         use std::os::unix::ffi::OsStringExt;
         let path = PathBuf::from(std::ffi::OsString::from_vec(b"/mounted/\xff.png".to_vec()));
@@ -210,6 +211,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // KIOFuse replies are POSIX mount paths.
     fn rejects_invalid_bridge_replies() {
         assert_eq!(
             mounted_path(&("relative/book.cbz",).to_variant()),

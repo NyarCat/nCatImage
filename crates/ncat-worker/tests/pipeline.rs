@@ -1,3 +1,7 @@
+//! Pipeline tests drive fake workers through POSIX shell scripts and raw non-UTF-8
+//! paths, so they run on Unix only.
+#![cfg(unix)]
+
 use image::{ImageBuffer, Rgba};
 use ncat_backend::{Backend, BackendOptions, Book, Event, Frame, View};
 use ncat_core::{DEFAULT_BUDGET, MIB};
