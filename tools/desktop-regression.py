@@ -124,19 +124,17 @@ def main():
     assert reply.unpack() == (1,), "KIOFuse already owns this bus; refusing to replace it"
     xml = '<node><interface name="org.kde.KIOFuse.VFS"><method name="mountUrl"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>'
     pending = []
+    delayed = []
 
     def on_call(connection, sender, path, interface, method, params, invocation):
         uri = params.unpack()[0]
         assert uri.split(":", 1)[0] in ["smb", "ftp", "sftp"]
-        def respond():
-            invocation.return_value(GLib.Variant("(s)", (str(inputs["book"]),)))
-            return GLib.SOURCE_REMOVE
         if "/hang" in uri:
             pending.append(invocation)
         elif "/delay" in uri:
-            GLib.timeout_add(2500, respond)
+            delayed.append(invocation)
         else:
-            respond()
+            invocation.return_value(GLib.Variant("(s)", (str(inputs["book"]),)))
 
     registration = bus.register_object("/org/kde/KIOFuse", Gio.DBusNodeInfo.new_for_xml(xml).interfaces[0], on_call, None, None)
     wm = subprocess.Popen(["openbox"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -284,6 +282,7 @@ def main():
 
         app, directory = launch("cancel-stale", "smb://DO-NOT-LOG.invalid/delay")
         win = window()
+        wait(lambda: delayed, "delayed mount request")
         assert "NetworkResolving" in log_snapshot(win, directory)
         activate(win)
         key("ctrl+l")
@@ -291,7 +290,8 @@ def main():
         subprocess.run(["xdotool", "type", "--clearmodifiers", "--delay", "1", inputs["last"].as_uri()], check=True)
         key("Return")
         page(3)
-        pump(2.6)
+        delayed.pop().return_value(GLib.Variant("(s)", (str(inputs["book"]),)))
+        pump(.5)
         page(3)
         text = log_snapshot(win, directory)
         assert "NetworkCancelled" in text and "NetworkResolved" not in text
