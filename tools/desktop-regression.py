@@ -10,7 +10,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk
 import pyatspi
 
-from smoke_support import arguments, check_privacy, fixtures, image_command, logs, work_directory
+from smoke_support import arguments, check_privacy, fixtures, image_command, work_directory
 
 
 def main():
@@ -50,7 +50,17 @@ def main():
         pump(.13)
 
     def nodes(node=None):
-        node = pyatspi.Registry.getDesktop(0) if node is None else node
+        if node is None:
+            desktop = pyatspi.Registry.getDesktop(0)
+            for application in desktop:
+                # Ignore the test's own GTK drag source and stale apps during
+                # process restarts; only query accessibility on the viewer.
+                try:
+                    if application and application.name in ["ncat-linux", "ncat-desktop"]:
+                        yield from nodes(application)
+                except (GLib.Error, RuntimeError):
+                    continue
+            return
         yield node
         for child in node:
             if child:
@@ -78,10 +88,33 @@ def main():
         bounds = spin.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
         click(win, bounds.x + bounds.width // 3, bounds.y + bounds.height // 2)
 
-    def launch(label, uri=None, smoke=False):
+    def log_snapshot(win, directory):
+        activate(win)
+        subprocess.run(["xdotool", "mousemove", "--window", win, "380", "320", "click", "3"], check=True)
+        # GTK 4.14 exports the popover items in order but may omit their names.
+        items = wait(lambda: showing("menu item"), "context menu")
+        assert len(items) == 4
+        popup = wait(lambda: command("xdotool", "search", "--onlyvisible", "--name",
+                                     "^ncat-linux$").splitlines()[-1], "popup surface")
+        bounds = items[-1].queryComponent().getExtents(pyatspi.WINDOW_COORDS)
+        click(popup, bounds.x + bounds.width // 2, bounds.y + bounds.height // 2)
+        dialog = wait(lambda: next((n for n in nodes() if n.name == "로그 보기"
+                                     and n.getRoleName() in ["frame", "dialog"]), None), "log window")
+        text_node = wait(lambda: next((n for n in nodes(dialog) if n.getRoleName() == "text"), None),
+                         "log text")
+        assert not text_node.getState().contains(pyatspi.STATE_EDITABLE)
+        text = text_node.queryText().getText(0, -1)
+        key("Escape")
+        wait(lambda: not any(n.name == "로그 보기" and n.getRoleName() in ["frame", "dialog"]
+                             for n in nodes()), "close log window")
+        assert not (directory / "log").exists(), "app created a diagnostic log directory"
+        check_privacy(text)
+        return text
+
+    def launch(label, uri=None):
         directory = work / label
         directory.mkdir()
-        argv = (["--smoke-test"] if smoke else []) + ([str(uri)] if uri else [])
+        argv = [str(uri)] if uri else []
         return subprocess.Popen(image_command(args.image, *argv), cwd=directory), directory
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
@@ -118,6 +151,9 @@ def main():
         def page(number):
             wait(lambda: command("xdotool", "getwindowname", win).startswith(f"{number}/3 · "), f"page {number}")
         page(1)
+        text = log_snapshot(win, directory)
+        assert "backend_ready" in text and "Ready { wayland: false }" in text
+        print("PASS context menu log viewer, read-only text, and no log files")
         wait(lambda: showing("spin button"), "accessible controls")
         for press, target in [("Down", 2), ("Up", 1), ("space", 2), ("BackSpace", 1), ("Next", 2), ("Prior", 1), ("Tab", 1), ("Down", 2), ("Up", 1)]:
             key(press)
@@ -216,10 +252,11 @@ def main():
             pump(.25)
             move = subprocess.Popen(["xdotool", "windowactivate", "--sync", source_id, "mousemove", "100", "120", "mousedown", "1", "sleep", ".2", "mousemove", "115", "135", "sleep", ".2", "mousemove", "270", "180", "sleep", ".2", "mousemove", "500", "350", "sleep", ".3", "mousemove", "750", "550", "sleep", ".4", "mouseup", "1"])
             wait(lambda: move.poll() is not None, "drag input")
-            wait(lambda: expected in logs(directory), label + " outcome")
-            pump(.1)
-            text = logs(directory)
-            check_privacy(text)
+            def outcome():
+                text = log_snapshot(win, directory)
+                return text if expected in text else None
+
+            text = wait(outcome, label + " outcome")
             if expected == "Displayed":
                 assert "Received" in text and "OpenQueued" in text
             elif expected == "OpenFailed":
@@ -234,17 +271,20 @@ def main():
         source = None
 
         for protocol in ["smb", "ftp", "sftp"]:
-            app, directory = launch(protocol, f"{protocol}://DO-NOT-LOG.invalid/book.cbz", smoke=True)
+            app, directory = launch(protocol, f"{protocol}://DO-NOT-LOG.invalid/book.cbz")
+            win = window()
+            page(1)
+            text = log_snapshot(win, directory)
+            assert "NetworkResolved" in text and "bridge: KioFuse" in text
+            activate(win)
+            key("Escape")
             wait(lambda: app.poll() is not None, protocol + " open")
             assert app.returncode == 0
-            text = logs(directory)
-            check_privacy(text)
-            assert "NetworkResolved" in text and "bridge: KioFuse" in text
             print("PASS mocked OS bridge:", protocol)
 
         app, directory = launch("cancel-stale", "smb://DO-NOT-LOG.invalid/delay")
-        wait(lambda: "NetworkResolving" in logs(directory), "resolving")
         win = window()
+        assert "NetworkResolving" in log_snapshot(win, directory)
         activate(win)
         key("ctrl+l")
         wait(lambda: command("xdotool", "search", "--onlyvisible", "--name", "네트워크 파일 또는 폴더 열기"), "network dialog")
@@ -253,8 +293,7 @@ def main():
         page(3)
         pump(2.6)
         page(3)
-        text = logs(directory)
-        check_privacy(text)
+        text = log_snapshot(win, directory)
         assert "NetworkCancelled" in text and "NetworkResolved" not in text
         activate(win)
         key("Escape")
@@ -262,14 +301,13 @@ def main():
         print("PASS network entry, cancellation and stale-result suppression")
 
         app, directory = launch("close-busy", "sftp://DO-NOT-LOG.invalid/hang")
-        wait(lambda: "NetworkResolving" in logs(directory), "busy mount")
         win = window()
+        assert "NetworkResolving" in log_snapshot(win, directory)
         activate(win)
         key("F11")
         key("Escape")
         wait(lambda: app.poll() is not None, "nonblocking fullscreen exit", seconds=3)
-        assert "NetworkCancelled" in logs(directory)
-        check_privacy(logs(directory))
+        assert not (directory / "log").exists()
         print("PASS fullscreen exit while remote service has not replied")
     finally:
         if app and app.poll() is None:

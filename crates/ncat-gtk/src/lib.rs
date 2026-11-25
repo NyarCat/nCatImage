@@ -833,6 +833,65 @@ impl Ui {
         }
     }
 
+    fn show_log(&self) {
+        let log = self.backend.diagnostic_log();
+        let text = gtk::TextView::builder()
+            .editable(false)
+            .monospace(true)
+            .wrap_mode(gtk::WrapMode::WordChar)
+            .top_margin(8)
+            .bottom_margin(8)
+            .left_margin(8)
+            .right_margin(8)
+            .build();
+        text.buffer().set_text(&log);
+        let scroll = gtk::ScrolledWindow::builder()
+            .vexpand(true)
+            .child(&text)
+            .build();
+        let close = gtk::Button::builder()
+            .label("닫기")
+            .halign(gtk::Align::End)
+            .build();
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 8);
+        content.set_margin_top(8);
+        content.set_margin_bottom(8);
+        content.set_margin_start(8);
+        content.set_margin_end(8);
+        content.append(&scroll);
+        content.append(&close);
+        let dialog = gtk::Window::builder()
+            .title("로그 보기")
+            .transient_for(&self.window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .default_width(760)
+            .default_height(420)
+            .child(&content)
+            .build();
+        dialog.set_application(self.window.application().as_ref());
+        let weak = dialog.downgrade();
+        close.connect_clicked(move |_| {
+            if let Some(dialog) = weak.upgrade() {
+                dialog.close();
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        let weak = dialog.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key == gdk::Key::Escape {
+                if let Some(dialog) = weak.upgrade() {
+                    dialog.close();
+                }
+                glib::Propagation::Stop
+            } else {
+                glib::Propagation::Proceed
+            }
+        });
+        dialog.add_controller(keys);
+        dialog.present();
+    }
+
     fn network_dialog(self: &Rc<Self>) {
         let dialog = gtk::Window::builder()
             .title("네트워크 파일 또는 폴더 열기")
@@ -1137,10 +1196,11 @@ fn icon_button(glyph: &str, label: &str) -> gtk::Button {
     button
 }
 
-const OPEN_MENU_ITEMS: [(&str, &str); 3] = [
+const OPEN_MENU_ITEMS: [(&str, &str); 4] = [
     ("open-file", "파일 열기…"),
     ("open-folder", "폴더 열기…"),
     ("open-address", "주소 열기…"),
+    ("view-log", "로그 보기"),
 ];
 
 fn open_menu_model() -> gio::Menu {
@@ -1160,7 +1220,15 @@ fn show_open_menu(
     let popover = gtk::PopoverMenu::from_model(Some(menu));
     popover.set_parent(anchor);
     popover.set_pointing_to(Some(&gdk::Rectangle::new(x, y, 1, 1)));
-    popover.connect_closed(|popover| popover.unparent());
+    popover.connect_closed(|popover| {
+        // GTK can close a menu item before dispatching its window action.
+        let popover = popover.clone();
+        glib::idle_add_local_once(move || {
+            if popover.parent().is_some() {
+                popover.unparent();
+            }
+        });
+    });
     popover.popup();
     popover
 }
@@ -1518,7 +1586,9 @@ fn build(
                 match id {
                     "open-file" => ui.dialog(false),
                     "open-folder" => ui.dialog(true),
-                    _ => ui.network_dialog(),
+                    "open-address" => ui.network_dialog(),
+                    "view-log" => ui.show_log(),
+                    _ => unreachable!("unknown context menu action"),
                 }
             }
         });

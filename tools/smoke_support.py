@@ -54,10 +54,6 @@ def fixtures(work):
     return {"root": root, "folder": folder, "book": book, "last": pages[-1], "bad": bad}
 
 
-def logs(directory):
-    return "\n".join(path.read_text() for path in (directory / "log").glob("ncat-incident-*.log"))
-
-
 def check_privacy(text):
     for secret in ["DO-NOT-LOG", "file://", "smb://", "sftp://", "ftp://", "127.0.0.1", "anonymous"]:
         assert secret not in text, "diagnostic log contains source/endpoint data"

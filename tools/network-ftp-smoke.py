@@ -7,7 +7,7 @@ import threading
 from pyftpdlib.authorizers import DummyAuthorizer
 from pyftpdlib.handlers import FTPHandler
 from pyftpdlib.servers import FTPServer
-from smoke_support import arguments, check_privacy, fixtures, image_command, logs, work_directory
+from smoke_support import arguments, fixtures, image_command, work_directory
 
 
 def main():
@@ -32,16 +32,14 @@ def main():
             uri = f"ftp://127.0.0.1:{port}/{escaped}" + ("/" if kind == "folder" else "")
             result = subprocess.run(image_command(args.image, "--smoke-navigation", uri), cwd=directory,
                                     capture_output=True, text=True, timeout=35)
-            text = logs(directory)
-            check_privacy(text)
-            assert result.returncode == 0, f"{kind} failed; sanitized diagnostics: {directory / 'log'}"
+            assert result.returncode == 0, f"{kind} failed (exit {result.returncode})"
             assert "navigation_smoke=ok" in result.stdout
-            assert "NetworkResolved" in text and "bridge: KioFuse" in text
-            print(f"PASS real FTP {kind}: 500 navigation requests; redacted logs")
+            assert not (directory / "log").exists()
+            print(f"PASS real FTP {kind}: 500 navigation requests; no diagnostic files")
     finally:
         server.close_all()
         thread.join(timeout=2)
-    print(f"Synthetic inputs and diagnostic results retained in {work}")
+    print(f"Synthetic inputs retained in {work}")
 
 
 if __name__ == "__main__":

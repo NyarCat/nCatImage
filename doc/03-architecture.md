@@ -98,7 +98,7 @@ v0.5.1 wire v3은 animation의 확인된 `total`(없으면 unknown)을 전달하
 
 0.4.3의 실제 네트워크·진단 경계: `ncat-linux/src/network.rs`가 SMB/FTP/SFTP URI를 검증하고 세션 D-Bus의 KIOFuse `mountUrl` 또는 GIO/GVfs/FUSE에서 로컬 경로를 얻는다. 파일 내용·목록·코덱 처리는 기존 worker에 남긴다. GLib future와 별도 요청 번호로 결과를 연결하며 새 열기·페이지 이동·종료는 이전 future를 abort하고 backend generation을 무효화한다. 앱 연결 대기 60초와 worker 작업 제한 15초는 별도 단계이고 OS 마운트 자체의 취소는 보장하지 않는다.
 
-GUI는 타입이 제한된 진단 이벤트를 최대 32개 큐에 넣고 기존 coordinator가 디스크에 쓴다. FUSE 최초 stat 변화는 catalog/frame 게시 전 새 worker로 최초 열기 한 번만 재시도한다. 기존 책의 리비전·캐시 검사는 유지한다. 자체 프로토콜/계정/다운로드 관리자나 추가 Tokio/thread pool은 도입하지 않았다.
+GUI의 타입이 제한된 진단 이벤트와 coordinator의 진단 이벤트는 공용 메모리 기록에 합쳐진다. UI는 우클릭 메뉴에서 기록의 스냅샷을 표시하며 디스크에 쓰지 않는다. FUSE 최초 stat 변화는 catalog/frame 게시 전 새 worker로 최초 열기 한 번만 재시도한다. 기존 책의 리비전·캐시 검사는 유지한다. 자체 프로토콜/계정/다운로드 관리자나 추가 Tokio/thread pool은 도입하지 않았다.
 
 crate 분리는 GUI 교체 가능성을 돕지만 Windows/macOS 지원 완료를 뜻하지 않는다. GTK뿐 아니라 Unix 경로·rustix·worker 보호/IPC·OS 연결·패키징도 이식해야 한다. 아래 협력 종료/유휴 정책은 목표이며 현재 구현 차이는 08을 따른다.
 

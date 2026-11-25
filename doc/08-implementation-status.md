@@ -229,6 +229,6 @@ NCAT_WORKER="$PWD/target/release/ncat-worker" cargo run --release --locked -p nc
 
 ## 6. 다음 작업
 
-`ncat-backend::diagnostics`는 현재 디렉터리의 `log/`에 시작 준비·드롭·네트워크 연결과 원본 변경/워커/전경 오류·복구 단계 snapshot을 남긴다. 일반 탐색 이력은 메모리 128개로 제한하며 GUI 이벤트 큐는 최대 32개, 디스크 I/O는 coordinator에서 수행한다. 줄당 1KiB·관리 파일 8개·0600과 다른 파일/심볼릭 링크 보존·저장 실패 시 읽기 계속 정책을 검증했다. URI/서버/자격증명도 기록하지 않는다. 06의 opt-in 상세 logger 전체/3일 retention은 여전히 미구현이다.
+v0.6.1부터 `ncat-backend::diagnostics`는 시작 준비·드롭·네트워크 연결과 원본 변경/워커/전경 오류·복구 단계를 최대 128줄(줄당 1KiB)의 공용 메모리에만 남긴다. Linux·Windows의 우클릭 메뉴에서 읽기 전용 스냅샷을 볼 수 있다. 로그 파일을 만들지 않으며 이전 로그 파일은 건드리지 않는다. URI/서버/자격증명도 기록하지 않는다.
 
 M0 잔여 우선순위는 (1) JPEG 축소 API/색관리·메모리 비용, (2) Ubuntu/renderer/작은 RAM 기준 corpus·UI 제시 계측, (3) RAR과 worker 제한/라이선스 PoC다. 그 후 M1 ViewPlan/고해상도·prefetch 비가시/압력 정책을 보강하고 M2 실제 두 장/기록/검색/접근성으로 확장한다. 단순 기능 수를 늘리려고 목표/제한을 숨기지 않는다.

@@ -1,16 +1,8 @@
-//! Bounded, path-redacted incident snapshots. Only the coordinator does disk I/O.
-use std::{
-    collections::VecDeque,
-    fs,
-    io::{self, Write},
-    path::{Path, PathBuf},
-    time::{Instant, SystemTime, UNIX_EPOCH},
-};
+//! Bounded, path-redacted diagnostics retained only for the current run.
+use std::{collections::VecDeque, time::Instant};
 
 const HISTORY_LINES: usize = 128;
 const MAX_LINE_BYTES: usize = 1024;
-const MAX_FILES: usize = 8;
-const PREFIX: &str = "ncat-incident-";
 
 /// Only typed, path-free data may cross the GUI diagnostic boundary.
 #[derive(Clone, Copy, Debug)]
@@ -103,21 +95,15 @@ pub enum DropRejection {
 }
 
 pub(crate) struct Diagnostics {
-    directory: PathBuf,
     history: VecDeque<String>,
     started: Instant,
-    sequence: u64,
-    warned: bool,
 }
 
 impl Diagnostics {
-    pub fn new(directory: PathBuf) -> Self {
+    pub fn new() -> Self {
         Self {
-            directory,
             history: VecDeque::new(),
             started: Instant::now(),
-            sequence: 0,
-            warned: false,
         }
     }
     // Callers supply only fixed stage labels, numeric counters and typed error codes.
@@ -136,83 +122,22 @@ impl Diagnostics {
         }
         self.history.push_back(line);
     }
-    pub fn incident(&mut self) {
-        if self.write_snapshot().is_err() && !self.warned {
-            self.warned = true;
-            eprintln!("nCatImage: could not write diagnostic log (log directory unavailable)");
-        }
-    }
-    fn write_snapshot(&mut self) -> io::Result<()> {
-        match ncat_platform::create_private_directory(&self.directory) {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
-        }
-        if !fs::symlink_metadata(&self.directory)?.is_dir() {
-            return Err(io::Error::other("not a directory"));
-        }
-        let mut files = Vec::new();
-        for entry in fs::read_dir(&self.directory)? {
-            let entry = entry?;
-            if entry.file_type()?.is_file() && managed_name(&entry.path()) {
-                files.push(entry.path());
-            }
-        }
-        files.sort();
-        // These names are reserved for this logger; never touch other files or symlinks.
-        let remove = files.len().saturating_add(1).saturating_sub(MAX_FILES);
-        for path in files.into_iter().take(remove) {
-            fs::remove_file(path)?;
-        }
-        self.sequence += 1;
-        let timestamp = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        let name = format!(
-            "{PREFIX}{timestamp}-{}-{}.log",
-            std::process::id(),
-            self.sequence
-        );
-        let mut file = ncat_platform::create_private_file(&self.directory.join(name))?;
-        writeln!(
-            file,
-            "ncat-diagnostics-v1 unix_ns={timestamp} pid={} backend_version={} retention_files={MAX_FILES}",
-            std::process::id(),
-            env!("CARGO_PKG_VERSION")
-        )?;
-        for line in &self.history {
-            writeln!(file, "{line}")?;
-        }
-        file.flush()
-    }
-}
-
-fn managed_name(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let Some(parts) = name
-        .strip_prefix(PREFIX)
-        .and_then(|name| name.strip_suffix(".log"))
-    else {
-        return false;
-    };
-    let parts: Vec<_> = parts.split('-').collect();
-    parts.len() == 3
-        && parts
+    pub fn snapshot(&self) -> String {
+        self.history
             .iter()
-            .all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit()))
+            .map(String::as_str)
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
-#[cfg(all(test, unix))]
+#[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{PermissionsExt, symlink};
+
     #[test]
     fn drop_snapshots_contain_stages_without_source_data() {
-        let root = tempfile::tempdir().unwrap();
-        let mut log = Diagnostics::new(root.path().join("log"));
+        let mut log = Diagnostics::new();
         for event in [
             DropEvent::Ready { wayland: true },
             DropEvent::Received {
@@ -224,14 +149,7 @@ mod tests {
         ] {
             log.record(format!("stage=drop event={event:?}"));
         }
-        log.write_snapshot().unwrap();
-        let file = fs::read_dir(root.path().join("log"))
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap()
-            .path();
-        let text = fs::read_to_string(file).unwrap();
+        let text = log.snapshot();
         assert!(text.contains("Ready { wayland: true }"));
         assert!(text.contains("Received { file_list: true, items: 1 }"));
         assert!(text.contains("Displayed { generation: 7 }"));
@@ -239,47 +157,20 @@ mod tests {
         assert!(!text.contains(".cbz"));
     }
     #[test]
-    fn lazy_bounded_private_snapshots_keep_recent_context_and_other_files() {
-        let root = tempfile::tempdir().unwrap();
-        let directory = root.path().join("log");
-        let mut log = Diagnostics::new(directory.clone());
+    fn history_keeps_only_recent_bounded_utf8_lines() {
+        let mut log = Diagnostics::new();
+        assert!(log.snapshot().is_empty());
         for i in 0..200 {
             log.record(format!("stage=request generation={i}"));
         }
-        assert!(!directory.exists());
-        log.write_snapshot().unwrap();
-        fs::write(directory.join("user-notes.txt"), "keep").unwrap();
-        fs::write(directory.join("ncat-incident-custom.log"), "keep").unwrap();
-        for _ in 0..12 {
-            log.write_snapshot().unwrap();
-        }
-        let files: Vec<_> = fs::read_dir(&directory)
-            .unwrap()
-            .map(|e| e.unwrap().path())
-            .filter(|p| managed_name(p))
-            .collect();
-        assert_eq!(files.len(), MAX_FILES);
-        let text = fs::read_to_string(&files[0]).unwrap();
-        assert!(text.contains("generation=199"));
-        assert!(!text.contains("generation=0\n"));
-        assert!(text.len() <= (HISTORY_LINES + 1) * (MAX_LINE_BYTES + 1));
-        assert_eq!(
-            fs::metadata(&files[0]).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
-        assert!(directory.join("user-notes.txt").exists());
-        assert!(directory.join("ncat-incident-custom.log").exists());
-    }
-    #[test]
-    fn rejects_symlink_directory_and_log_failure_is_nonfatal() {
-        let root = tempfile::tempdir().unwrap();
-        let target = root.path().join("target");
-        fs::create_dir(&target).unwrap();
-        let link = root.path().join("log");
-        symlink(&target, &link).unwrap();
-        let mut log = Diagnostics::new(link);
-        log.incident();
-        assert!(log.warned);
-        assert_eq!(fs::read_dir(target).unwrap().count(), 0);
+        log.record("한".repeat(MAX_LINE_BYTES));
+        let text = log.snapshot();
+        assert_eq!(text.lines().count(), HISTORY_LINES);
+        assert!(text.lines().next().unwrap().ends_with("generation=73"));
+        assert!(text.contains("generation=199\n"));
+        let last = text.lines().last().unwrap();
+        assert!((MAX_LINE_BYTES - 2..=MAX_LINE_BYTES).contains(&last.len()));
+        assert!(last.ends_with('한'));
+        assert!(Diagnostics::new().snapshot().is_empty());
     }
 }

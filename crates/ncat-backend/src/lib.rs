@@ -9,7 +9,6 @@ use cache::{FrameCache, Key, Revision, Target};
 pub use diagnostics::{DropEvent, DropRejection, NetworkBridge, NetworkFailure, NetworkProtocol};
 pub use options::BackendOptions;
 use std::cell::Cell;
-use std::collections::VecDeque;
 pub use worker_command::WorkerCommand;
 
 use ncat_core::{Budget, DEFAULT_BUDGET, MIB, Permit};
@@ -145,7 +144,7 @@ struct Shared {
     pending: Mutex<Option<Job>>,
     neighbor: Mutex<Option<Neighbor>>,
     neighbor_request: AtomicU64,
-    drop_diagnostics: Mutex<VecDeque<DropEvent>>,
+    diagnostics: Mutex<diagnostics::Diagnostics>,
     wake: Condvar,
     generation: AtomicU64,
     closing: AtomicBool,
@@ -154,6 +153,12 @@ struct Shared {
     stats: Stats,
     prefetch_enabled: AtomicBool,
     options: BackendOptions,
+}
+
+impl Shared {
+    fn record(&self, event: String) {
+        self.diagnostics.lock().unwrap().record(event);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -279,7 +284,7 @@ impl Backend {
             pending: Mutex::new(None),
             neighbor: Mutex::new(None),
             neighbor_request: AtomicU64::new(0),
-            drop_diagnostics: Mutex::new(VecDeque::new()),
+            diagnostics: Mutex::new(diagnostics::Diagnostics::new()),
             wake: Condvar::new(),
             generation: AtomicU64::new(0),
             closing: AtomicBool::new(false),
@@ -289,6 +294,7 @@ impl Backend {
             prefetch_enabled: AtomicBool::new(options.prefetch),
             options,
         });
+        shared.record("stage=backend_ready".into());
         let (sender, events) = async_channel::bounded(4);
         let control = shared.clone();
         thread::Builder::new()
@@ -392,19 +398,15 @@ impl Backend {
             self.shared.wake.notify_one();
         }
     }
-    /// Enqueue a bounded, typed diagnostic event. Disk I/O stays on the existing
-    /// coordinator; no paths, file names, MIME strings or GTK types are accepted.
+    /// Record a bounded, typed diagnostic event in memory. No source data is accepted.
     pub fn diagnose_drop(&self, event: DropEvent) {
-        let _pending = self.shared.pending.lock().unwrap();
-        if self.shared.closing.load(Ordering::Acquire) {
-            return;
+        if !self.shared.closing.load(Ordering::Acquire) {
+            self.shared.record(format!("stage=drop event={event:?}"));
         }
-        let mut queue = self.shared.drop_diagnostics.lock().unwrap();
-        if queue.len() == 32 {
-            queue.pop_front();
-        }
-        queue.push_back(event);
-        self.shared.wake.notify_one();
+    }
+    /// Return the recent redacted diagnostics for this run, oldest first.
+    pub fn diagnostic_log(&self) -> String {
+        self.shared.diagnostics.lock().unwrap().snapshot()
     }
     pub fn events(&self) -> async_channel::Receiver<Event> {
         self.events.clone()
@@ -897,22 +899,17 @@ struct Engine {
     cache: FrameCache,
     previous: Option<(u64, usize)>,
     forward: bool,
-    diagnostics: diagnostics::Diagnostics,
 }
 
 impl Engine {
-    fn trace(&mut self, stage: &str, shared: &Shared) {
-        self.diagnostics.record(format!(
+    fn trace(&self, stage: &str, shared: &Shared) {
+        shared.record(format!(
             "stage={stage} generation={} reserved={} budget={} stats={:?}",
             shared.generation.load(Ordering::Acquire),
             shared.budget.used(),
             shared.budget.limit(),
             shared.stats.snapshot()
         ));
-    }
-    fn incident(&mut self, stage: &str, shared: &Shared) {
-        self.trace(stage, shared);
-        self.diagnostics.incident();
     }
     fn worker(&mut self, shared: &Shared) -> Result<&mut Worker, ErrorCode> {
         if self.worker.as_ref().is_some_and(|w| w.child.is_none()) {
@@ -955,16 +952,16 @@ impl Engine {
                 Ok(key)
             }
             Err(error) => {
-                self.diagnostics.record(format!(
+                shared.record(format!(
                     "stage=key_validation_failed error={error:?} epoch={} view={}x{} rotation={}",
                     book.epoch, view.width, view.height, view.quarter_turns
                 ));
                 if let (Some(before), Ok(now)) =
                     (&book.source_revision, Revision::read(&book.source.path()))
                 {
-                    self.diagnostics.record(before.differences(&now));
+                    shared.record(before.differences(&now));
                 }
-                self.incident("key_validation_failure", shared);
+                self.trace("key_validation_failure", shared);
                 if matches!(book.pages[index].key, ncat_protocol::PageKey::Zip(_)) {
                     self.cache.clear();
                 } else {
@@ -994,7 +991,7 @@ impl Engine {
         {
             self.stop_worker();
         }
-        self.diagnostics.record(format!("stage=frame_request request_generation={} epoch={} background={} view={}x{} rotation={}", guard.generation, book.epoch, guard.prefetch, view.width, view.height, view.quarter_turns));
+        shared.record(format!("stage=frame_request request_generation={} epoch={} background={} view={}x{} rotation={}", guard.generation, book.epoch, guard.prefetch, view.width, view.height, view.quarter_turns));
         let key = self.key(book, index, view, shared)?;
         if let Some((frame, prefetched)) = self.cache.get(&key) {
             self.trace("cache_hit", shared);
@@ -1036,7 +1033,7 @@ impl Engine {
             .decode(&book.pages[index], view, shared, guard)
         {
             Err(ErrorCode::Changed) if !guard.prefetch => {
-                self.incident("worker_reported_changed", shared);
+                self.trace("worker_reported_changed", shared);
                 // A worker session may have gone stale. Never treat its error alone as
                 // proof that the user's source changed, and never mask a real change.
                 // Revalidate the parent's original key, then rebuild the session once.
@@ -1072,7 +1069,7 @@ impl Engine {
                         if self.key(book, index, view, shared)? != key {
                             return Err(ErrorCode::Changed);
                         }
-                        self.incident(
+                        self.trace(
                             "reopened_worker_still_reports_changed_source_stable",
                             shared,
                         );
@@ -1080,7 +1077,7 @@ impl Engine {
                     }
                     result => {
                         let frame = result?;
-                        self.incident("source_reopen_decode_succeeded", shared);
+                        self.trace("source_reopen_decode_succeeded", shared);
                         frame
                     }
                 }
@@ -1095,7 +1092,7 @@ impl Engine {
             other => other?,
         };
         if self.key(book, index, view, shared)? != key {
-            self.incident("source_changed_during_decode", shared);
+            self.trace("source_changed_during_decode", shared);
             return Err(ErrorCode::Changed);
         }
         if frame.info.animation.is_some() {
@@ -1194,7 +1191,7 @@ impl Engine {
                 // No catalog/frame has been published yet: retry a fresh open
                 // once, retaining all revision checks on the new snapshot.
                 if matches!(opened, Err(ErrorCode::Changed)) && current(shared, generation) {
-                    self.incident("open_revision_retry", shared);
+                    self.trace("open_revision_retry", shared);
                     self.stop_worker();
                     opened = self
                         .worker(shared)?
@@ -1228,7 +1225,7 @@ impl Engine {
                         },
                     )?,
                     Err(code) if current(shared, generation) => {
-                        self.incident(&format!("open_frame_error_{code:?}"), shared);
+                        self.trace(&format!("open_frame_error_{code:?}"), shared);
                         emit(sender, shared, Event::Error { generation, code })?
                     }
                     Err(code) => return Err(code),
@@ -1327,7 +1324,7 @@ impl Engine {
                 error,
                 ErrorCode::Changed | ErrorCode::Worker | ErrorCode::Protocol | ErrorCode::Timeout
             ) {
-                self.incident(&format!("prefetch_error_{error:?}"), shared);
+                self.trace(&format!("prefetch_error_{error:?}"), shared);
             } else {
                 self.trace(&format!("prefetch_result_{error:?}"), shared);
             }
@@ -1355,25 +1352,18 @@ fn coordinator(
         cache: FrameCache::new(cache_bytes),
         previous: None,
         forward: true,
-        diagnostics: diagnostics::Diagnostics::new(PathBuf::from("log")),
     };
     let mut prefetch = None;
     enum Work {
         Foreground(Job),
         Neighbor(Neighbor),
         Prefetch(PrefetchPlan),
-        Diagnostics(VecDeque<DropEvent>),
         StopAnimation,
     }
     loop {
         let work = {
             let mut pending = shared.pending.lock().unwrap();
             loop {
-                let mut diagnostics = shared.drop_diagnostics.lock().unwrap();
-                if !diagnostics.is_empty() {
-                    break Some(Work::Diagnostics(std::mem::take(&mut *diagnostics)));
-                }
-                drop(diagnostics);
                 if shared.closing.load(Ordering::Acquire) {
                     break None;
                 }
@@ -1399,14 +1389,6 @@ fn coordinator(
         match work {
             None => break,
             Some(Work::StopAnimation) => engine.stop_worker(),
-            Some(Work::Diagnostics(events)) => {
-                for event in events {
-                    engine
-                        .diagnostics
-                        .record(format!("stage=drop event={event:?}"));
-                }
-                engine.diagnostics.incident();
-            }
             Some(Work::Prefetch(plan)) => engine.prefetch(plan, &shared),
             Some(Work::Neighbor(Neighbor {
                 request,
@@ -1440,7 +1422,7 @@ fn coordinator(
                         if code == ErrorCode::Cancelled {
                             engine.trace("foreground_cancelled", &shared);
                         } else {
-                            engine.incident(&format!("foreground_error_{code:?}"), &shared);
+                            engine.trace(&format!("foreground_error_{code:?}"), &shared);
                         }
                         if code != ErrorCode::Cancelled
                             || engine.worker.as_ref().is_some_and(|w| w.child.is_none())
@@ -1485,7 +1467,7 @@ mod guard_tests {
             pending: Mutex::new(None),
             neighbor: Mutex::new(None),
             neighbor_request: AtomicU64::new(0),
-            drop_diagnostics: Mutex::new(VecDeque::new()),
+            diagnostics: Mutex::new(diagnostics::Diagnostics::new()),
             wake: Condvar::new(),
             generation: AtomicU64::new(1),
             closing: AtomicBool::new(false),
@@ -1505,26 +1487,18 @@ mod guard_tests {
             shared: shared.clone(),
             events,
         };
-        for generation in 0..100 {
+        for generation in 0..200 {
             backend.diagnose_drop(DropEvent::OpenQueued { generation });
         }
-        {
-            let queue = shared.drop_diagnostics.lock().unwrap();
-            assert_eq!(queue.len(), 32);
-            assert!(matches!(
-                queue.front(),
-                Some(DropEvent::OpenQueued { generation: 68 })
-            ));
-            assert!(matches!(
-                queue.back(),
-                Some(DropEvent::OpenQueued { generation: 99 })
-            ));
-        }
+        let log = backend.diagnostic_log();
+        assert_eq!(log.lines().count(), 128);
+        assert!(log.lines().next().unwrap().ends_with("generation: 72 }"));
+        assert!(log.ends_with("generation: 199 }"));
         assert!(shared.pending.lock().unwrap().is_none());
         assert_eq!(backend.generation(), 1);
         backend.shutdown();
         backend.diagnose_drop(DropEvent::Left);
-        assert_eq!(shared.drop_diagnostics.lock().unwrap().len(), 32);
+        assert_eq!(backend.diagnostic_log(), log);
     }
 
     #[test]

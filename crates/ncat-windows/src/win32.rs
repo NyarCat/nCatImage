@@ -71,6 +71,7 @@ const FRAME_GO: u16 = 120;
 const TOP_PIN: u16 = 123;
 const BOTTOM_PIN: u16 = 124;
 const METADATA: u16 = 125;
+const VIEW_LOG: u16 = 126;
 const INFO_SIZE: (i32, i32) = (52, 44);
 
 fn control_bar(id: u16) -> Bar {
@@ -1444,6 +1445,7 @@ impl App {
                         }
                     }
                 }
+                VIEW_LOG => log_dialog(self.hwnd, &self.backend.diagnostic_log()),
                 PREVIOUS => self.navigate(false),
                 NEXT => self.navigate(true),
                 PAGE_GO => {
@@ -1992,6 +1994,7 @@ unsafe fn open_menu(hwnd: HWND, location: LPARAM) -> Option<u16> {
             (OPEN, w!("파일 열기…")),
             (FOLDER, w!("폴더 열기…")),
             (CONNECT, w!("주소 열기…")),
+            (VIEW_LOG, w!("로그 보기")),
         ] {
             AppendMenuW(menu, MF_STRING, usize::from(id), caption);
         }
@@ -2019,6 +2022,114 @@ unsafe fn open_menu(hwnd: HWND, location: LPARAM) -> Option<u16> {
         );
         DestroyMenu(menu);
         (command != 0).then_some(command as u16)
+    }
+}
+
+unsafe fn log_dialog(owner: HWND, log: &str) {
+    use windows_sys::core::w;
+    #[repr(C, align(4))]
+    struct Template {
+        dialog: DLGTEMPLATE,
+        menu: u16,
+        class: u16,
+        title: [u16; 1],
+    }
+    let template = Template {
+        dialog: DLGTEMPLATE {
+            style: WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME as u32 | DS_CENTER as u32,
+            dwExtendedStyle: 0,
+            cdit: 0,
+            x: 0,
+            y: 0,
+            cx: 370,
+            cy: 210,
+        },
+        menu: 0,
+        class: 0,
+        title: [0],
+    };
+    unsafe extern "system" fn callback(
+        hwnd: HWND,
+        message: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> isize {
+        // SAFETY: controls are owned by this UI thread; the UTF-16 snapshot
+        // lives throughout DialogBoxIndirectParamW and is copied by the edit.
+        unsafe {
+            match message {
+                WM_INITDIALOG => {
+                    SetWindowTextW(hwnd, w!("로그 보기"));
+                    let instance = GetModuleHandleW(ptr::null());
+                    let mut rect = RECT::default();
+                    GetClientRect(hwnd, &mut rect);
+                    let edit = CreateWindowExW(
+                        WS_EX_CLIENTEDGE,
+                        w!("EDIT"),
+                        lparam as *const u16,
+                        WS_CHILD
+                            | WS_VISIBLE
+                            | WS_TABSTOP
+                            | WS_VSCROLL
+                            | ES_MULTILINE as u32
+                            | ES_READONLY as u32
+                            | ES_AUTOVSCROLL as u32,
+                        10,
+                        10,
+                        rect.right - 20,
+                        rect.bottom - 52,
+                        hwnd,
+                        ptr::null_mut(),
+                        instance,
+                        ptr::null(),
+                    );
+                    let close = CreateWindowExW(
+                        0,
+                        w!("BUTTON"),
+                        w!("닫기"),
+                        WS_CHILD | WS_VISIBLE | WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+                        rect.right - 82,
+                        rect.bottom - 34,
+                        72,
+                        26,
+                        hwnd,
+                        IDOK as usize as _,
+                        instance,
+                        ptr::null(),
+                    );
+                    if edit.is_null() || close.is_null() {
+                        EndDialog(hwnd, 0);
+                        return 1;
+                    }
+                    let font = GetStockObject(DEFAULT_GUI_FONT) as usize;
+                    SendMessageW(edit, WM_SETFONT, font, 1);
+                    SendMessageW(close, WM_SETFONT, font, 1);
+                    SendMessageW(hwnd, DM_SETDEFID, IDOK as usize, 0);
+                    SetFocus(edit);
+                    0
+                }
+                WM_CLOSE => {
+                    EndDialog(hwnd, 0);
+                    1
+                }
+                WM_COMMAND if matches!(wparam as u16 as i32, IDOK | IDCANCEL) => {
+                    EndDialog(hwnd, 0);
+                    1
+                }
+                _ => 0,
+            }
+        }
+    }
+    let text = wide(&log.replace('\n', "\r\n"));
+    // SAFETY: the aligned template and NUL-terminated text live through the modal call.
+    unsafe {
+        DialogBoxIndirectParamW(
+            GetModuleHandleW(ptr::null()),
+            &raw const template.dialog,
+            owner,
+            Some(callback),
+            text.as_ptr() as LPARAM,
+        );
     }
 }
 
