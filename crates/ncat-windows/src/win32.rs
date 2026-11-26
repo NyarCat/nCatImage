@@ -6,6 +6,7 @@ use ncat_presentation::{
     input::{self, Command, Key, Modifiers},
     playback::{Playback, SPEEDS},
     reader_bars::{Bar, ReaderBars},
+    window_state::{self, WindowSize},
 };
 use std::{
     cell::{Cell, RefCell},
@@ -27,6 +28,12 @@ use windows_sys::Win32::{
     System::{Com::*, LibraryLoader::GetModuleHandleW},
     UI::{
         Controls::{Dialogs::*, EM_SETLIMITTEXT, WM_MOUSELEAVE},
+        HiDpi::{
+            AreDpiAwarenessContextsEqual, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+            DPI_AWARENESS_PER_MONITOR_AWARE, GetAwarenessFromDpiAwarenessContext, GetDpiForWindow,
+            GetThreadDpiAwarenessContext, GetWindowDpiAwarenessContext,
+            SetProcessDpiAwarenessContext,
+        },
         Input::KeyboardAndMouse::*,
         Shell::*,
         WindowsAndMessaging::*,
@@ -41,13 +48,13 @@ const LIVE_RESIZE_TEST: u32 = WM_APP + 3;
 const ANIMATION: usize = 1;
 const SHUTDOWN: usize = 2;
 const DEADLINE: usize = 3;
-const RESIZE: usize = 4;
 const RESIZE_TEST: usize = 5;
 const METADATA_TEST: usize = 6;
 const GLASS_SETTLE: usize = 7;
-const VIEW_SETTLE_MS: u32 = 100;
 const TOP_SIZE: (i32, i32) = (306, 44);
 const BOTTOM_SIZE: (i32, i32) = (252, 44);
+const ZOOM_READOUT_WIDTH: i32 = 136;
+const BASE_DPI: u32 = 96;
 const ANIMATION_SIZE: (i32, i32) = (318, 44);
 const OPEN: u16 = 101;
 const FOLDER: u16 = 102;
@@ -72,7 +79,9 @@ const TOP_PIN: u16 = 123;
 const BOTTOM_PIN: u16 = 124;
 const METADATA: u16 = 125;
 const VIEW_LOG: u16 = 126;
+const COPY_METADATA: u16 = 127;
 const INFO_SIZE: (i32, i32) = (52, 44);
+const METADATA_TOOLBAR_HEIGHT: i32 = 36;
 
 fn control_bar(id: u16) -> Bar {
     match id {
@@ -217,8 +226,11 @@ impl Drop for Window {
 struct App {
     metadata: ncat_presentation::metadata::MetadataOverlay,
     metadata_hwnd: HWND,
+    metadata_copy: HWND,
     metadata_bounds: Cell<Option<(i32, i32, i32, i32)>>,
     hwnd: HWND,
+    startup_image: bool,
+    normal_size: Option<WindowSize>,
     controls: Vec<(u16, HWND, i32, i32)>,
     paint_buffer: Option<PaintBuffer>,
     bar_tint: Option<PaintBuffer>,
@@ -259,10 +271,9 @@ struct App {
     navigation_left: u32,
     modal_load_generation: Option<u64>,
     success: bool,
-    resized_view: Option<View>,
-    view_deadline: Option<Instant>,
+    resized_viewport: Option<(i32, i32)>,
     resize_test_phase: u8,
-    resize_test_expected: Option<(View, u32)>,
+    resize_test_expected: Option<u32>,
     paint_count: u32,
     buffered_picture: Option<(i32, i32)>,
     glass_draw_count: u32,
@@ -270,6 +281,55 @@ struct App {
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
+}
+
+unsafe fn work_area(hwnd: HWND) -> Option<RECT> {
+    // SAFETY: queried on the UI thread for its own window.
+    unsafe {
+        monitor_info(MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST)).map(|info| info.rcWork)
+    }
+}
+
+unsafe fn monitor_info(monitor: HMONITOR) -> Option<MONITORINFO> {
+    // SAFETY: the initialized monitor info is local to the call.
+    unsafe {
+        let mut info = MONITORINFO {
+            cbSize: std::mem::size_of::<MONITORINFO>() as u32,
+            ..Default::default()
+        };
+        (GetMonitorInfoW(monitor, &mut info) != 0).then_some(info)
+    }
+}
+
+fn dpi_units(value: i32, from_dpi: u32, to_dpi: u32) -> i32 {
+    let from = i64::from(from_dpi.max(1));
+    ((i64::from(value.max(1)) * i64::from(to_dpi) + from / 2) / from).clamp(1, i64::from(i32::MAX))
+        as i32
+}
+
+unsafe fn window_dpi(hwnd: HWND) -> u32 {
+    // SAFETY: a live HWND on its owning thread; zero means unavailable.
+    match unsafe { GetDpiForWindow(hwnd) } {
+        0 => BASE_DPI,
+        dpi => dpi,
+    }
+}
+
+unsafe fn position_in_work_area(hwnd: HWND, rect: RECT, work: RECT, width: i32, height: i32) {
+    // SAFETY: called on the owning UI thread; SetWindowPos does not retain data.
+    unsafe {
+        SetWindowPos(
+            hwnd,
+            ptr::null_mut(),
+            rect.left
+                .clamp(work.left, (work.right - width).max(work.left)),
+            rect.top
+                .clamp(work.top, (work.bottom - height).max(work.top)),
+            width,
+            height,
+            SWP_NOZORDER | SWP_NOACTIVATE,
+        );
+    }
 }
 
 unsafe fn set_child_visible(hwnd: HWND, show: bool) {
@@ -319,8 +379,11 @@ impl App {
             Self {
                 metadata: ncat_presentation::metadata::MetadataOverlay::default(),
                 metadata_hwnd: ptr::null_mut(),
+                metadata_copy: ptr::null_mut(),
                 metadata_bounds: Cell::new(None),
                 hwnd: ptr::null_mut(),
+                startup_image: false,
+                normal_size: None,
                 controls: Vec::new(),
                 paint_buffer: None,
                 bar_tint: None,
@@ -361,8 +424,7 @@ impl App {
                 navigation_left: if smoke == Smoke::Navigation { 500 } else { 0 },
                 modal_load_generation: None,
                 success: false,
-                resized_view: None,
-                view_deadline: None,
+                resized_viewport: None,
                 resize_test_phase: 0,
                 resize_test_expected: None,
                 paint_count: 0,
@@ -401,18 +463,68 @@ impl App {
             rect
         }
     }
-    unsafe fn view(&self) -> View {
+    fn view(&self) -> View {
+        View {
+            width: ncat_protocol::MAX_VIEW_DIMENSION,
+            height: ncat_protocol::MAX_VIEW_DIMENSION,
+            quarter_turns: self.reader.quarter_turns,
+        }
+    }
+
+    unsafe fn remember_normal_size(&mut self) {
+        if self.fullscreen.is_some() {
+            return;
+        }
+        // SAFETY: placement is initialized for this UI-thread window.
         unsafe {
-            let rect = self.viewport();
-            let (width, height) = self.reader.render_size(
-                (rect.right, rect.bottom - rect.top),
-                1.0,
-                ncat_protocol::MAX_VIEW_DIMENSION,
+            let mut placement = WINDOWPLACEMENT {
+                length: std::mem::size_of::<WINDOWPLACEMENT>() as u32,
+                ..Default::default()
+            };
+            if GetWindowPlacement(self.hwnd, &mut placement) != 0 {
+                let rect = placement.rcNormalPosition;
+                let dpi = window_dpi(self.hwnd);
+                self.normal_size = WindowSize::new(
+                    dpi_units(rect.right - rect.left, dpi, BASE_DPI),
+                    dpi_units(rect.bottom - rect.top, dpi, BASE_DPI),
+                );
+            }
+        }
+    }
+
+    unsafe fn grow_for_startup_image(&mut self) {
+        // SAFETY: hwnd and temporary rectangles belong to the viewer's UI thread.
+        unsafe {
+            if !std::mem::take(&mut self.startup_image)
+                || self.fullscreen.is_some()
+                || IsZoomed(self.hwnd) != 0
+                || IsIconic(self.hwnd) != 0
+            {
+                return;
+            }
+            let viewport = self.viewport();
+            if viewport.right <= 0 || viewport.bottom <= 0 {
+                return;
+            }
+            let mut rect = RECT::default();
+            let Some(work) =
+                work_area(self.hwnd).filter(|_| GetWindowRect(self.hwnd, &mut rect) != 0)
+            else {
+                return;
+            };
+            let (width, height) = (rect.right - rect.left, rect.bottom - rect.top);
+            let frame = (width - viewport.right, height - viewport.bottom);
+            let image = self.picture_dimensions(viewport);
+            let (dx, dy) = window_state::startup_growth(
+                image,
+                (viewport.right, viewport.bottom),
+                (
+                    work.right - work.left - frame.0,
+                    work.bottom - work.top - frame.1,
+                ),
             );
-            View {
-                width,
-                height,
-                quarter_turns: self.reader.quarter_turns,
+            if dx != 0 || dy != 0 {
+                position_in_work_area(self.hwnd, rect, work, width + dx, height + dy);
             }
         }
     }
@@ -431,6 +543,15 @@ impl App {
             right: left + width,
             top,
             bottom: top + height,
+        }
+    }
+
+    fn zoom_readout_rect(viewport: RECT) -> RECT {
+        let tools = Self::bar_rect(Bar::Bottom, viewport);
+        RECT {
+            left: (tools.left - ZOOM_READOUT_WIDTH).max(0),
+            right: tools.left,
+            ..tools
         }
     }
 
@@ -628,10 +749,10 @@ impl App {
                 .lines()
                 .map(|line| line.chars().count().div_ceil(columns).max(1))
                 .sum();
-            let top = Self::info_rect(viewport).bottom + 8;
+            let top = Self::info_rect(viewport).bottom + 8 + METADATA_TOOLBAR_HEIGHT;
             let bottom = BOTTOM_SIZE.1 + 12;
             let height = (viewport.bottom - top - bottom)
-                .min(300)
+                .min(300 - METADATA_TOOLBAR_HEIGHT)
                 .min((lines * 20 + 20) as i32);
             let show = self.metadata.visible() && width >= 80 && height >= 40;
             let bounds = (viewport.right - width - 12, top, width, height);
@@ -646,8 +767,18 @@ impl App {
                     height,
                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
                 );
+                SetWindowPos(
+                    self.metadata_copy,
+                    ptr::null_mut(),
+                    bounds.0 + width - 40,
+                    top - 32,
+                    32,
+                    28,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOCOPYBITS,
+                );
             }
             set_child_visible(self.metadata_hwnd, show);
+            set_child_visible(self.metadata_copy, show);
         }
     }
     unsafe fn sync_metadata(&self) {
@@ -681,7 +812,11 @@ impl App {
         unsafe {
             KillTimer(self.hwnd, METADATA_TEST);
             let result = (|| {
-                if self.metadata.enabled || IsWindowVisible(self.metadata_hwnd) != 0 {
+                let visible = |hwnd| IsWindowVisible(hwnd) != 0;
+                if self.metadata.enabled
+                    || visible(self.metadata_hwnd)
+                    || visible(self.metadata_copy)
+                {
                     return false;
                 }
                 if self.smoke == Smoke::MetadataWindow {
@@ -698,7 +833,10 @@ impl App {
                     return false;
                 }
                 let focus = GetFocus();
-                if !self.key(VK_TAB as u32) || IsWindowVisible(self.metadata_hwnd) == 0 {
+                if !self.key(VK_TAB as u32)
+                    || !visible(self.metadata_hwnd)
+                    || !visible(self.metadata_copy)
+                {
                     return false;
                 }
                 if GetFocus() != focus
@@ -715,20 +853,20 @@ impl App {
                 self.live_sizing = true;
                 self.layout();
                 self.metadata_layout();
-                let kept_during_resize = IsWindowVisible(self.metadata_hwnd) != 0;
+                let kept_during_resize = visible(self.metadata_hwnd) && visible(self.metadata_copy);
                 self.live_sizing = false;
                 self.layout();
                 if !kept_during_resize {
                     return false;
                 }
                 self.command(METADATA, 0);
-                if IsWindowVisible(self.metadata_hwnd) != 0 {
+                if visible(self.metadata_hwnd) || visible(self.metadata_copy) {
                     return false;
                 }
                 self.key(VK_TAB as u32);
                 self.metadata.clear();
                 self.sync_metadata();
-                IsWindowVisible(self.metadata_hwnd) == 0
+                !visible(self.metadata_hwnd) && !visible(self.metadata_copy)
             })();
             self.success = result;
             if result {
@@ -778,7 +916,10 @@ impl App {
         unsafe {
             self.layout();
             self.metadata_layout();
-            self.queue_view_refresh();
+            let rect = self.viewport();
+            if IsIconic(self.hwnd) == 0 && rect.right > 0 && rect.bottom > 0 {
+                self.resized_viewport = Some((rect.right, rect.bottom));
+            }
         }
     }
 
@@ -790,52 +931,14 @@ impl App {
             }
         }
     }
-    unsafe fn queue_view_refresh(&mut self) {
-        unsafe {
-            self.cancel_view_refresh();
-            if self.closing.is_some() || IsIconic(self.hwnd) != 0 {
-                return;
-            }
-            let rect = self.viewport();
-            if rect.right <= 0 || rect.bottom <= rect.top {
-                return;
-            }
-            let view = self.view();
-            self.resized_view = Some(view);
-            if view != self.animation_view && self.book.as_ref().is_some_and(|book| book.complete) {
-                self.view_deadline =
-                    Some(Instant::now() + Duration::from_millis(u64::from(VIEW_SETTLE_MS)));
-                SetTimer(self.hwnd, RESIZE, VIEW_SETTLE_MS, None);
-            }
-        }
-    }
-    unsafe fn cancel_view_refresh(&mut self) {
-        unsafe {
-            KillTimer(self.hwnd, RESIZE);
-            self.view_deadline = None;
-        }
-    }
-    unsafe fn resize_finished(&mut self) {
-        unsafe {
-            // KillTimer cannot remove an already posted WM_TIMER.
-            if self.view_deadline.is_none_or(|at| Instant::now() < at) {
-                return;
-            }
-            self.cancel_view_refresh();
-            if self.closing.is_none()
-                && IsIconic(self.hwnd) == 0
-                && self.view() != self.animation_view
-            {
-                self.load(self.selected);
-            }
-        }
-    }
     unsafe fn resize_test(&mut self) {
         unsafe {
-            if let Some((expected, paints)) = self.resize_test_expected.take() {
+            if let Some(paints) = self.resize_test_expected.take() {
                 // The window manager may adjust maximize bounds asynchronously.
                 // Validate the settled client area, not the immediate ShowWindow result.
-                if self.resized_view != Some(self.view())
+                let viewport = self.viewport();
+                let expected = Some((viewport.right, viewport.bottom));
+                if self.resized_viewport != expected
                     || self.paint_count <= paints
                     || !self.bar_geometry_matches()
                     || (self.smoke == Smoke::ResizeFrame
@@ -844,7 +947,7 @@ impl App {
                     eprintln!(
                         "nCatImage: resize phase={} expected={expected:?} actual={:?} paints={paints}->{} buffered={:?}",
                         self.resize_test_phase,
-                        self.resized_view,
+                        self.resized_viewport,
                         self.paint_count,
                         self.buffered_picture,
                     );
@@ -925,11 +1028,8 @@ impl App {
                     } else {
                         self.zoom(0.0);
                     }
-                    if self.frame.is_none()
-                        || self.backend.generation() != generation
-                        || self.view_deadline.is_none()
-                    {
-                        eprintln!("nCatImage: zoom must retain the frame and defer decoding");
+                    if self.frame.is_none() || self.backend.generation() != generation {
+                        eprintln!("nCatImage: zoom must retain the frame without decoding");
                         self.close();
                         return;
                     }
@@ -947,7 +1047,7 @@ impl App {
             }
             self.resize_test_phase += 1;
             if IsIconic(self.hwnd) == 0 {
-                self.resize_test_expected = Some((self.view(), self.paint_count));
+                self.resize_test_expected = Some(self.paint_count);
             }
         }
     }
@@ -1050,8 +1150,12 @@ impl App {
         }
     }
     unsafe fn open(&mut self, path: PathBuf) {
+        self.startup_image = false;
+        unsafe { self.open_impl(path) };
+    }
+
+    unsafe fn open_impl(&mut self, path: PathBuf) {
         unsafe {
-            self.cancel_view_refresh();
             self.reset(true);
             self.page_loading = false;
             self.book = None;
@@ -1063,6 +1167,7 @@ impl App {
             self.pan = (0, 0);
             self.animation_view = self.view();
             if let Err(code) = self.backend.open(path, self.animation_view) {
+                self.startup_image = false;
                 self.set_status(&code.to_string());
             } else {
                 self.page_loading = true;
@@ -1086,7 +1191,6 @@ impl App {
             else {
                 return;
             };
-            self.cancel_view_refresh();
             self.reset(index != self.selected);
             self.selected = index;
             self.animation_view = self.view();
@@ -1114,6 +1218,7 @@ impl App {
                 && index != self.selected
             {
                 self.reader.zoom = 1.0;
+                self.reader.fit = false;
                 self.reader.quarter_turns = 0;
                 self.pan = (0, 0);
                 self.load(index);
@@ -1189,14 +1294,17 @@ impl App {
             if self.book.is_none() {
                 return;
             }
-            let previous = self.reader.zoom;
-            self.reader.change_zoom(factor);
-            if self.reader.zoom == previous && self.pan == (0, 0) {
+            let previous = self.reader;
+            let viewport = self.viewport();
+            self.reader
+                .change_zoom(factor, (viewport.right, viewport.bottom), 1.0);
+            if self.reader == previous && self.pan == (0, 0) {
                 return;
             }
             self.pan = (0, 0);
+            self.glass_pending = true;
+            SetTimer(self.hwnd, GLASS_SETTLE, 120, None);
             self.invalidate_picture();
-            self.queue_view_refresh();
         }
     }
     unsafe fn fullscreen(&mut self) {
@@ -1213,6 +1321,7 @@ impl App {
                     SWP_NOZORDER | SWP_FRAMECHANGED,
                 );
             } else {
+                self.remember_normal_size();
                 let style = GetWindowLongPtrW(self.hwnd, GWL_STYLE);
                 let mut rect: RECT = std::mem::zeroed();
                 GetWindowRect(self.hwnd, &mut rect);
@@ -1264,8 +1373,6 @@ impl App {
                     self.selected = book.selected;
                     self.book = Some(book);
                     self.navigation_ui();
-                    // A resize may have arrived while the initial catalog was
-                    // incomplete and could not yet submit a replacement load.
                     self.viewport_changed();
                 }
                 Event::Frame { frame, .. } => {
@@ -1297,10 +1404,8 @@ impl App {
                         frame,
                         bgra: pixels,
                     });
-                    if std::mem::take(&mut self.page_loading) && self.view() != self.animation_view
-                    {
-                        self.queue_view_refresh();
-                    }
+                    self.page_loading = false;
+                    self.grow_for_startup_image();
                     self.refresh_glass();
                     self.playback_ui();
                     if matches!(self.smoke, Smoke::Frame | Smoke::Animation)
@@ -1342,6 +1447,7 @@ impl App {
                     }
                 }
                 Event::Error { code, .. } => {
+                    self.startup_image = false;
                     self.page_loading = false;
                     self.reset(true);
                     self.frame = None;
@@ -1412,7 +1518,7 @@ impl App {
                 return;
             }
             self.closing = Some(Instant::now());
-            KillTimer(self.hwnd, RESIZE);
+            self.remember_normal_size();
             KillTimer(self.hwnd, RESIZE_TEST);
             KillTimer(self.hwnd, METADATA_TEST);
             self.stop.store(true, Ordering::Release);
@@ -1446,6 +1552,11 @@ impl App {
                     }
                 }
                 VIEW_LOG => log_dialog(self.hwnd, &self.backend.diagnostic_log()),
+                COPY_METADATA if self.metadata.visible() => {
+                    if !copy_metadata_to_clipboard(self.hwnd, &self.metadata.text) {
+                        self.set_status("메타데이터를 복사하지 못했습니다");
+                    }
+                }
                 PREVIOUS => self.navigate(false),
                 NEXT => self.navigate(true),
                 PAGE_GO => {
@@ -1603,19 +1714,10 @@ impl App {
         }
     }
     fn picture_dimensions(&self, rect: RECT) -> (i32, i32) {
-        let height = rect.bottom - rect.top;
+        // A per-monitor-aware HWND exposes client and GDI coordinates in
+        // device pixels. Dividing by monitor DPI here would shrink the image.
         self.reader
-            .picture_size((rect.right, height))
-            .unwrap_or_else(|| {
-                let (w, h) = ncat_core::fit_size(
-                    self.reader.original.0,
-                    self.reader.original.1,
-                    rect.right.max(1) as u32,
-                    height.max(1) as u32,
-                )
-                .unwrap_or((1, 1));
-                (w as i32, h as i32)
-            })
+            .picture_size((rect.right, rect.bottom - rect.top), 1.0)
     }
 
     unsafe fn draw_picture(&mut self, dc: HDC, rect: RECT) -> Option<(i32, i32)> {
@@ -1628,12 +1730,11 @@ impl App {
             let brush = GetStockObject(DC_BRUSH);
             SetDCBrushColor(dc, 0x202020);
             if let Some(display) = &self.frame {
-                let max_x = (w - rect.right).max(0) / 2;
-                let max_y = (h - height).max(0) / 2;
-                self.pan.0 = self.pan.0.clamp(-max_x, max_x);
-                self.pan.1 = self.pan.1.clamp(-max_y, max_y);
-                let x = (rect.right - w) / 2 + self.pan.0;
-                let y = rect.top + (height - h) / 2 + self.pan.1;
+                let (x, y) = self
+                    .reader
+                    .picture_origin((w, h), (rect.right, height), self.pan);
+                self.pan = (x.min(0), y.min(0));
+                let y = rect.top + y;
                 let width = display.frame.info.width as i32;
                 let height = display.frame.info.height as i32;
                 SetStretchBltMode(dc, HALFTONE);
@@ -1756,17 +1857,34 @@ impl App {
                     brush,
                 );
             }
+            let copy_bar =
+                self.metadata_bounds
+                    .get()
+                    .map_or(RECT::default(), |(left, top, width, _)| RECT {
+                        left: left + width - 48,
+                        top: top - METADATA_TOOLBAR_HEIGHT,
+                        right: left + width,
+                        bottom: top,
+                    });
+            let tools = Self::bar_rect(Bar::Bottom, viewport);
+            let readout = Self::zoom_readout_rect(viewport);
+            let bottom = if self.frame.is_some() {
+                RECT {
+                    left: readout.left,
+                    ..tools
+                }
+            } else {
+                tools
+            };
             for (r, visible) in [
                 (
                     Self::bar_rect(Bar::Top, viewport),
                     self.visible_bars[Bar::Top as usize],
                 ),
-                (
-                    Self::bar_rect(Bar::Bottom, viewport),
-                    self.visible_bars[Bar::Bottom as usize],
-                ),
+                (bottom, self.visible_bars[Bar::Bottom as usize]),
                 (Self::animation_rect(viewport), self.visible_animation),
                 (Self::info_rect(viewport), self.visible_info),
+                (copy_bar, IsWindowVisible(self.metadata_copy) != 0),
             ] {
                 if !visible {
                     continue;
@@ -1815,6 +1933,34 @@ impl App {
                 SetDCBrushColor(dc, 0x181818);
                 DeleteObject(region);
             }
+            if self.visible_bars[Bar::Bottom as usize] && self.frame.is_some() {
+                let label = self
+                    .reader
+                    .zoom_readout((viewport.right, viewport.bottom), 1.0);
+                let saved = SaveDC(dc);
+                if saved != 0 {
+                    SelectObject(dc, GetStockObject(DEFAULT_GUI_FONT));
+                    SetBkMode(dc, TRANSPARENT as i32);
+                    SetTextColor(dc, 0xfff3ed);
+                    for (line, top) in label.lines().zip([readout.top + 6, readout.top + 24]) {
+                        let text = wide(line);
+                        let mut rect = RECT {
+                            left: readout.left + 8,
+                            top,
+                            right: readout.right - 8,
+                            bottom: top + 16,
+                        };
+                        DrawTextW(
+                            dc,
+                            text.as_ptr(),
+                            text.len() as i32 - 1,
+                            &mut rect,
+                            DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX | DT_END_ELLIPSIS,
+                        );
+                    }
+                    RestoreDC(dc, saved);
+                }
+            }
         }
     }
 
@@ -1826,10 +1972,9 @@ impl App {
             return;
         }
         let (w, h) = self.picture_dimensions(viewport);
-        let dx = (w - viewport.right).max(0) / 2;
-        let dy = (h - viewport.bottom).max(0) / 2;
-        let x = (viewport.right - w) / 2 + self.pan.0.clamp(-dx, dx);
-        let y = (viewport.bottom - h) / 2 + self.pan.1.clamp(-dy, dy);
+        let (x, y) =
+            self.reader
+                .picture_origin((w, h), (viewport.right, viewport.bottom), self.pan);
         let sw = (panel.right - panel.left + STEP - 1) / STEP;
         let sh = (panel.bottom - panel.top + STEP - 1) / STEP;
         if !(1..=128).contains(&sw) || !(1..=128).contains(&sh) {
@@ -2286,6 +2431,38 @@ unsafe fn folder_dialog(owner: HWND) -> Option<PathBuf> {
     }
 }
 
+fn copy_metadata_to_clipboard(owner: HWND, text: &str) -> bool {
+    use windows_sys::Win32::{
+        Foundation::GlobalFree,
+        System::{DataExchange::*, Memory::*, Ole::CF_UNICODETEXT},
+    };
+    let text = wide(&text.replace('\n', "\r\n"));
+    let bytes = text.len() * std::mem::size_of::<u16>();
+    // SAFETY: this runs on the owning GUI thread; only a successful
+    // SetClipboardData transfers ownership of the movable allocation to Windows.
+    unsafe {
+        let memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if memory.is_null() {
+            return false;
+        }
+        let buffer = GlobalLock(memory).cast::<u16>();
+        let mut transferred = false;
+        if !buffer.is_null() {
+            ptr::copy_nonoverlapping(text.as_ptr(), buffer, text.len());
+            GlobalUnlock(memory);
+            if OpenClipboard(owner) != 0 {
+                transferred = EmptyClipboard() != 0
+                    && !SetClipboardData(u32::from(CF_UNICODETEXT), memory).is_null();
+                CloseClipboard();
+            }
+        }
+        if !transferred {
+            GlobalFree(memory);
+        }
+        transferred
+    }
+}
+
 unsafe fn draw_glass_button(item: &windows_sys::Win32::UI::Controls::DRAWITEMSTRUCT) {
     use windows_sys::Win32::UI::Controls::{ODS_DISABLED, ODS_FOCUS, ODS_SELECTED};
     // SAFETY: Win32 lends the drawing DC for this WM_DRAWITEM only.
@@ -2320,6 +2497,21 @@ unsafe fn draw_glass_button(item: &windows_sys::Win32::UI::Controls::DRAWITEMSTR
         );
         let mut rect = item.rcItem;
         RoundRect(dc, rect.left, rect.top, rect.right, rect.bottom, 10, 10);
+        if item.CtlID as u16 == COPY_METADATA {
+            // Standard overlapping documents icon, drawn without a font dependency.
+            let x = (rect.left + rect.right) / 2;
+            let y = (rect.top + rect.bottom) / 2;
+            SetDCPenColor(dc, 0xfff3ed);
+            SelectObject(dc, GetStockObject(NULL_BRUSH));
+            MoveToEx(dc, x - 1, y - 5, ptr::null_mut());
+            LineTo(dc, x - 1, y - 8);
+            LineTo(dc, x + 8, y - 8);
+            LineTo(dc, x + 8, y + 3);
+            LineTo(dc, x + 5, y + 3);
+            Rectangle(dc, x - 6, y - 4, x + 5, y + 9);
+            RestoreDC(dc, saved);
+            return;
+        }
         let mut label = [0u16; 40];
         let length =
             GetWindowTextW(item.hwndItem, label.as_mut_ptr(), label.len() as i32).max(0) as usize;
@@ -2366,6 +2558,7 @@ unsafe fn attach_tooltips(
     owner: HWND,
     instance: windows_sys::Win32::Foundation::HINSTANCE,
     controls: &[(u16, HWND, i32, i32)],
+    metadata_copy: HWND,
 ) {
     use windows_sys::{Win32::UI::Controls::*, core::w};
     // SAFETY: the owned tooltip window and its tools live on the UI thread.
@@ -2395,7 +2588,12 @@ unsafe fn attach_tooltips(
         if tooltip.is_null() {
             return;
         }
-        for &(id, control, _, _) in controls {
+        for (id, control, _, _) in
+            controls
+                .iter()
+                .copied()
+                .chain([(COPY_METADATA, metadata_copy, 0, 0)])
+        {
             let label = match id {
                 PREVIOUS => w!("이전 페이지"),
                 NEXT => w!("다음 페이지"),
@@ -2406,6 +2604,7 @@ unsafe fn attach_tooltips(
                 FULLSCREEN => w!("전체 화면"),
                 TOP_PIN | BOTTOM_PIN => w!("고정 전환"),
                 METADATA => w!("메타데이터 · Tab"),
+                COPY_METADATA => w!("메타데이터 복사"),
                 FRAME_PREVIOUS => w!("이전 프레임"),
                 FRAME_NEXT => w!("다음 프레임"),
                 PLAY => w!("재생 / 일시정지"),
@@ -2666,8 +2865,35 @@ unsafe extern "system" fn procedure(
             info.ptMinTrackSize.x = info
                 .ptMinTrackSize
                 .x
-                .max(ANIMATION_SIZE.0 + BOTTOM_SIZE.0 + 40);
+                .max(ANIMATION_SIZE.0 + BOTTOM_SIZE.0 + ZOOM_READOUT_WIDTH + 40);
             info.ptMinTrackSize.y = info.ptMinTrackSize.y.max(260);
+            return 0;
+        }
+        if message == WM_DPICHANGED && lparam != 0 {
+            // USER32 supplies device-pixel window bounds. Do not hold an App
+            // borrow across SetWindowPos: it can synchronously send WM_SIZE.
+            let mut bounds = *(lparam as *const RECT);
+            let state = GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<App>;
+            let fullscreen = !state.is_null()
+                && (*state)
+                    .try_borrow()
+                    .is_ok_and(|app| app.fullscreen.is_some());
+            if fullscreen
+                && let Some(monitor) =
+                    monitor_info(MonitorFromRect(&bounds, MONITOR_DEFAULTTONEAREST))
+            {
+                bounds = monitor.rcMonitor;
+            }
+            SetWindowPos(
+                hwnd,
+                ptr::null_mut(),
+                bounds.left,
+                bounds.top,
+                bounds.right - bounds.left,
+                bounds.bottom - bounds.top,
+                SWP_NOZORDER | SWP_NOACTIVATE,
+            );
+            PostMessageW(hwnd, VIEWPORT_CHANGED, 0, 0);
             return 0;
         }
         if message == WM_DRAWITEM {
@@ -2801,8 +3027,6 @@ unsafe extern "system" fn procedure(
                     KillTimer(hwnd, GLASS_SETTLE);
                     app.glass_pending = false;
                     app.refresh_glass();
-                } else if wparam == RESIZE {
-                    app.resize_finished();
                 } else if wparam == METADATA_TEST {
                     app.metadata_test();
                 } else if wparam == RESIZE_TEST {
@@ -2812,7 +3036,23 @@ unsafe extern "system" fn procedure(
                     app.animation(None);
                 } else if wparam == DEADLINE {
                     if app.smoke == Smoke::Window {
-                        app.success = true;
+                        let context = GetWindowDpiAwarenessContext(hwnd);
+                        app.success = GetAwarenessFromDpiAwarenessContext(context)
+                            == DPI_AWARENESS_PER_MONITOR_AWARE;
+                        if app.success {
+                            // Wine can report v1 for windows created in a v2
+                            // process. The native smoke separately requires v2.
+                            let v2 = AreDpiAwarenessContextsEqual(
+                                context,
+                                DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2,
+                            ) != 0;
+                            println!(
+                                "window_dpi_smoke=ok per_monitor_v2={v2} dpi={}",
+                                window_dpi(hwnd)
+                            );
+                        } else {
+                            eprintln!("nCatImage: viewer is not per-monitor DPI aware");
+                        }
                     }
                     app.close();
                 } else if wparam == SHUTDOWN
@@ -2834,7 +3074,12 @@ unsafe extern "system" fn procedure(
                 app.controls_input = false;
                 SetFocus(hwnd);
                 app.layout();
-                if app.reader.zoom > 1.0 {
+                let viewport = app.viewport();
+                let picture = app.picture_dimensions(viewport);
+                if app.frame.is_some()
+                    && !app.reader.fit
+                    && (picture.0 > viewport.right || picture.1 > viewport.bottom)
+                {
                     app.drag = Some((
                         (lparam as u16) as i16 as i32,
                         ((lparam >> 16) as u16) as i16 as i32,
@@ -2854,8 +3099,8 @@ unsafe extern "system" fn procedure(
                         (lparam as u16) as i16 as i32,
                         ((lparam >> 16) as u16) as i16 as i32,
                     );
-                    app.pan.0 += point.0 - x;
-                    app.pan.1 += point.1 - y;
+                    app.pan.0 = app.pan.0.saturating_add(point.0 - x);
+                    app.pan.1 = app.pan.1.saturating_add(point.1 - y);
                     app.drag = Some(point);
                     app.refresh_glass();
                 }
@@ -2865,8 +3110,8 @@ unsafe extern "system" fn procedure(
                 let delta = ((wparam >> 16) as u16) as i16 as f64;
                 if GetKeyState(VK_CONTROL as i32) < 0 {
                     app.zoom(if delta > 0.0 { 1.1 } else { 1.0 / 1.1 });
-                } else if app.reader.zoom > 1.0 {
-                    app.pan.1 += (delta / 2.0) as i32;
+                } else if !app.reader.fit && app.reader.zoom > 1.0 {
+                    app.pan.1 = app.pan.1.saturating_add((delta / 2.0) as i32);
                     app.refresh_glass();
                 } else {
                     if app.wheel.signum() != delta.signum() {
@@ -2923,6 +3168,10 @@ unsafe extern "system" fn procedure(
 }
 
 pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
+    let state_path = (smoke == Smoke::None)
+        .then(window_state::state_path)
+        .flatten();
+    let restored = state_path.as_deref().and_then(window_state::load);
     let (app, sender) = App::new(smoke)?;
     let state = Box::new(RefCell::new(app));
     let class_name = wide("nCatImage.NativeViewer");
@@ -2934,6 +3183,14 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
     // SAFETY: static callback and run-owned state; synchronous calls use live,
     // NUL-terminated buffers. Shared bridges pass HWND integers, never App pointers.
     unsafe {
+        // Opt out of OS bitmap stretching before creating any GUI windows.
+        // The decoder worker never enters this path.
+        let dpi_context = DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2;
+        if SetProcessDpiAwarenessContext(dpi_context) == 0
+            && AreDpiAwarenessContextsEqual(GetThreadDpiAwarenessContext(), dpi_context) == 0
+        {
+            eprintln!("nCatImage: per-monitor DPI awareness unavailable");
+        }
         let com = CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32);
         let instance = GetModuleHandleW(ptr::null());
         let class = WNDCLASSW {
@@ -2969,8 +3226,27 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
             }
             let _window = Window(hwnd);
             {
+                let size = restored.unwrap_or(WindowSize {
+                    width: 1040,
+                    height: 820,
+                });
+                let mut rect = RECT::default();
+                if let Some(work) = work_area(hwnd).filter(|_| GetWindowRect(hwnd, &mut rect) != 0)
+                {
+                    let dpi = window_dpi(hwnd);
+                    position_in_work_area(
+                        hwnd,
+                        rect,
+                        work,
+                        dpi_units(size.width, BASE_DPI, dpi).min(work.right - work.left),
+                        dpi_units(size.height, BASE_DPI, dpi).min(work.bottom - work.top),
+                    );
+                }
+            }
+            {
                 let mut app = state.borrow_mut();
                 app.hwnd = hwnd;
+                app.remember_normal_size();
                 let specs = [
                     (PREVIOUS, "BUTTON", "이전 페이지", 8, 8, 36),
                     (PAGE, "EDIT", "1", 48, 8, 52),
@@ -3038,7 +3314,6 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
                         wide(&format!("{speed}×")).as_ptr() as isize,
                     );
                 }
-                attach_tooltips(hwnd, instance, &app.controls);
                 app.metadata_hwnd = CreateWindowExW(
                     0,
                     wide("EDIT").as_ptr(),
@@ -3058,9 +3333,24 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
                     instance,
                     ptr::null(),
                 );
-                if app.metadata_hwnd.is_null() {
+                app.metadata_copy = CreateWindowExW(
+                    0,
+                    windows_sys::core::w!("BUTTON"),
+                    windows_sys::core::w!("메타데이터 복사"),
+                    WS_CHILD | WS_TABSTOP | BS_OWNERDRAW as u32,
+                    0,
+                    0,
+                    32,
+                    28,
+                    hwnd,
+                    COPY_METADATA as usize as _,
+                    instance,
+                    ptr::null(),
+                );
+                if app.metadata_hwnd.is_null() || app.metadata_copy.is_null() {
                     return Err(io::Error::last_os_error());
                 }
+                attach_tooltips(hwnd, instance, &app.controls, app.metadata_copy);
                 SendMessageW(
                     app.metadata_hwnd,
                     WM_SETFONT,
@@ -3134,7 +3424,9 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
                 );
             }
             if let Some(path) = initial {
-                state.borrow_mut().open(path);
+                let mut app = state.borrow_mut();
+                app.startup_image = true;
+                app.open_impl(path);
             }
             let mut message: MSG = std::mem::zeroed();
             loop {
@@ -3187,6 +3479,12 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
         UnregisterClassW(class_name.as_ptr(), instance);
         if com >= 0 {
             CoUninitialize();
+        }
+        if result.is_ok()
+            && let (Some(path), Some(size)) = (state_path, state.borrow().normal_size)
+            && window_state::save(&path, size).is_err()
+        {
+            eprintln!("nCatImage: could not save window size");
         }
         result
     }

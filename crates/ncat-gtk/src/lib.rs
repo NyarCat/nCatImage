@@ -2,6 +2,7 @@
 
 mod input;
 pub mod network;
+mod picture;
 
 use gtk::{gdk, gio, glib, prelude::*};
 use ncat_backend::{
@@ -12,6 +13,7 @@ use ncat_presentation::playback::Playback;
 use ncat_presentation::{
     ReaderView, adjacent,
     reader_bars::{Bar, ReaderBars},
+    window_state::{self, WindowSize},
 };
 mod glass;
 use std::cell::{Cell, RefCell};
@@ -32,9 +34,13 @@ struct Ui {
     glass: glass::Glass,
     metadata: RefCell<ncat_presentation::metadata::MetadataOverlay>,
     metadata_label: gtk::Label,
-    metadata_panel: gtk::ScrolledWindow,
+    metadata_panel: gtk::Box,
     metadata_button: gtk::Button,
+    zoom_label: gtk::Label,
+    zoom_badge: gtk::Box,
     window: gtk::ApplicationWindow,
+    startup_image: Cell<bool>,
+    window_bounds: Cell<(i32, i32)>,
     header: gtk::Box,
     toolbar: gtk::Box,
     animation_controls: gtk::Box,
@@ -47,7 +53,7 @@ struct Ui {
     network_task: RefCell<Option<glib::JoinHandle<()>>>,
     resolve_network: network::Resolver,
     network_timer: RefCell<Option<glib::SourceId>>,
-    picture: gtk::Picture,
+    picture: picture::Picture,
     scroll: gtk::ScrolledWindow,
     status: RefCell<String>,
     position: gtk::SpinButton,
@@ -60,7 +66,6 @@ struct Ui {
     reader_view: Cell<ReaderView>,
     syncing: Cell<bool>,
     closing: Cell<bool>,
-    reload_timer: RefCell<Option<glib::SourceId>>,
     page_loading: Cell<bool>,
     loading_timer: RefCell<Option<glib::SourceId>>,
     animation_timer: RefCell<Option<glib::SourceId>>,
@@ -95,7 +100,7 @@ impl Ui {
         let original = self.metadata.borrow().text.clone();
         self.position.grab_focus();
         let focus = gtk::prelude::RootExt::focus(&self.window);
-        let picture = self.picture.paintable();
+        let picture = self.picture.texture();
         let controllers = self.window.observe_controllers();
         let keys = (0..controllers.n_items())
             .find_map(|index| {
@@ -127,7 +132,7 @@ impl Ui {
         ));
         assert!(!self.metadata_panel.is_visible());
         assert!(!self.metadata.borrow().enabled);
-        assert_eq!(self.picture.paintable(), picture);
+        assert_eq!(self.picture.texture(), picture);
         self.toggle_metadata();
         self.clear_metadata();
         assert!(!self.metadata_panel.is_visible());
@@ -469,15 +474,42 @@ impl Ui {
     }
 
     fn view(&self) -> View {
-        let scale = f64::from(self.window.scale_factor());
-        let w = self.scroll.width().max(320);
-        let h = self.scroll.height().max(240);
-        let state = self.reader_view.get();
-        let (width, height) = state.render_size((w, h), scale, ncat_protocol::MAX_VIEW_DIMENSION);
         View {
-            width,
-            height,
-            quarter_turns: state.quarter_turns,
+            width: ncat_protocol::MAX_VIEW_DIMENSION,
+            height: ncat_protocol::MAX_VIEW_DIMENSION,
+            quarter_turns: self.reader_view.get().quarter_turns,
+        }
+    }
+
+    fn viewport(&self) -> (i32, i32) {
+        (self.scroll.width(), self.scroll.height())
+    }
+
+    fn scale(&self) -> f64 {
+        self.window
+            .surface()
+            .as_ref()
+            .map_or(1.0, picture::surface_scale)
+    }
+
+    fn grow_for_startup_image(&self, image: (i32, i32)) {
+        if !self.startup_image.replace(false)
+            || self.window.is_maximized()
+            || self.window.is_fullscreen()
+        {
+            return;
+        }
+        let viewport = self.viewport();
+        let size = self.window.default_size();
+        if viewport.0 <= 0 || viewport.1 <= 0 {
+            return;
+        }
+        let extra = ((size.0 - viewport.0).max(0), (size.1 - viewport.1).max(0));
+        let bounds = self.window_bounds.get();
+        let (dx, dy) =
+            window_state::startup_growth(image, viewport, (bounds.0 - extra.0, bounds.1 - extra.1));
+        if dx != 0 || dy != 0 {
+            self.window.set_default_size(size.0 + dx, size.1 + dy);
         }
     }
 
@@ -519,6 +551,11 @@ impl Ui {
     }
 
     fn open_file(self: &Rc<Self>, file: gio::File, from_drop: bool) -> bool {
+        self.startup_image.set(false);
+        self.open_file_impl(file, from_drop)
+    }
+
+    fn open_file_impl(self: &Rc<Self>, file: gio::File, from_drop: bool) -> bool {
         self.cancel_network();
         let location = match network::classify(file) {
             Ok(location) => location,
@@ -615,10 +652,11 @@ impl Ui {
         self.cancel_reload();
         self.book.borrow_mut().take();
         self.reset_playback(true);
-        self.picture.set_paintable(gdk::Paintable::NONE);
+        self.picture.set_texture(None);
         self.clear_metadata();
         self.selected.set(0);
         self.reader_view.set(ReaderView::default());
+        self.reset_pan();
         self.layout_picture();
         self.animation_view.set(self.view());
         match self.backend.open(path, self.animation_view.get()) {
@@ -647,9 +685,6 @@ impl Ui {
 
     fn cancel_reload(&self) {
         if let Some(timer) = self.animation_timer.borrow_mut().take() {
-            timer.remove();
-        }
-        if let Some(timer) = self.reload_timer.borrow_mut().take() {
             timer.remove();
         }
     }
@@ -697,8 +732,10 @@ impl Ui {
         if index != self.selected.get() {
             let mut state = self.reader_view.get();
             state.zoom = 1.0;
+            state.fit = false;
             state.quarter_turns = 0;
             self.reader_view.set(state);
+            self.reset_pan();
             self.layout_picture();
             self.load(index);
         } else {
@@ -760,43 +797,44 @@ impl Ui {
     }
 
     fn layout_picture(&self) {
-        let size = self
-            .reader_view
-            .get()
-            .picture_size((self.scroll.width(), self.scroll.height()));
-        if let Some((w, h)) = size {
-            self.scroll
-                .set_policy(gtk::PolicyType::Automatic, gtk::PolicyType::Automatic);
-            self.picture.set_size_request(w, h);
-            self.picture.set_content_fit(gtk::ContentFit::Contain);
-        } else {
-            self.scroll
-                .set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
-            self.picture.set_size_request(-1, -1);
-            self.picture.set_content_fit(gtk::ContentFit::ScaleDown);
+        self.picture.set_view(self.reader_view.get());
+        self.update_zoom_badge();
+    }
+
+    fn update_zoom_badge(&self) {
+        let visible = self.picture.texture().is_some();
+        self.zoom_badge.set_visible(visible);
+        if visible {
+            let viewport = (
+                self.scroll.hadjustment().page_size() as i32,
+                self.scroll.vadjustment().page_size() as i32,
+            );
+            let viewport = if viewport.0 > 0 && viewport.1 > 0 {
+                viewport
+            } else {
+                self.viewport()
+            };
+            let text = self.reader_view.get().zoom_readout(viewport, self.scale());
+            if self.zoom_label.text().as_str() != text {
+                self.zoom_label.set_text(&text);
+            }
         }
     }
 
-    fn change_zoom(self: &Rc<Self>, factor: f64) {
+    fn reset_pan(&self) {
+        self.scroll.hadjustment().set_value(0.0);
+        self.scroll.vadjustment().set_value(0.0);
+    }
+
+    fn change_zoom(&self, factor: f64) {
         if self.page_loading.get() || self.book.borrow().is_none() {
             return;
         }
         let mut state = self.reader_view.get();
-        state.change_zoom(factor);
+        state.change_zoom(factor, self.viewport(), self.scale());
         self.reader_view.set(state);
+        self.reset_pan();
         self.layout_picture();
-        self.cancel_reload();
-        self.backend.cancel();
-        let weak = Rc::downgrade(self);
-        *self.reload_timer.borrow_mut() = Some(glib::timeout_add_local_once(
-            Duration::from_millis(100),
-            move || {
-                if let Some(ui) = weak.upgrade() {
-                    ui.reload_timer.borrow_mut().take();
-                    ui.load(ui.selected.get());
-                }
-            },
-        ));
     }
 
     fn rotate(self: &Rc<Self>, backwards: bool) {
@@ -1004,7 +1042,7 @@ impl Ui {
                     info.stride as usize,
                 );
                 // GBytes owns FrameBytes, so the reservation survives the GUI's local variables.
-                self.picture.set_paintable(Some(&texture));
+                self.picture.set_texture(Some(texture));
                 self.page_loading.set(false);
                 if let Some(generation) = self.drop_generation.take() {
                     self.backend
@@ -1013,6 +1051,7 @@ impl Ui {
                 let mut state = self.reader_view.get();
                 state.original = (info.original_width, info.original_height);
                 self.reader_view.set(state);
+                self.grow_for_startup_image(state.picture_size(self.viewport(), self.scale()));
                 self.layout_picture();
                 if let Some(animation) = &info.animation {
                     let mut state = self.playback.get();
@@ -1079,6 +1118,7 @@ impl Ui {
                 }
             }
             Event::Error { code, .. } => {
+                self.startup_image.set(false);
                 self.page_loading.set(false);
                 self.reset_playback(true);
                 if let Some(timer) = self.animation_timer.borrow_mut().take() {
@@ -1091,7 +1131,8 @@ impl Ui {
                 if let Some(timer) = self.loading_timer.borrow_mut().take() {
                     timer.remove();
                 }
-                self.picture.set_paintable(gdk::Paintable::NONE);
+                self.picture.set_texture(None);
+                self.update_zoom_badge();
                 self.clear_metadata();
                 self.set_status(&code.to_string());
                 if self.smoke {
@@ -1173,7 +1214,7 @@ impl Ui {
         }
         self.backend.shutdown();
         self.book.borrow_mut().take();
-        self.picture.set_paintable(gdk::Paintable::NONE);
+        self.picture.set_texture(None);
         self.clear_metadata();
     }
 }
@@ -1239,6 +1280,7 @@ fn build(
     mode: SmokeMode,
     smoke_ok: Rc<Cell<bool>>,
     resolve_network: network::Resolver,
+    window_size: Rc<Cell<Option<WindowSize>>>,
 ) {
     let smoke = mode != SmokeMode::None;
     let smoke_empty = mode == SmokeMode::Empty;
@@ -1253,11 +1295,15 @@ fn build(
             return;
         }
     };
+    let size = window_size.get().unwrap_or(WindowSize {
+        width: 1000,
+        height: 800,
+    });
     let window = gtk::ApplicationWindow::builder()
         .application(app)
         .title(concat!("nCatImage · v", env!("CARGO_PKG_VERSION")))
-        .default_width(1000)
-        .default_height(800)
+        .default_width(size.width)
+        .default_height(size.height)
         .build();
     let header = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let direction = gtk::ToggleButton::with_label("우→좌");
@@ -1265,19 +1311,15 @@ fn build(
     let fullscreen = icon_button("⛶", "전체 화면");
     let top_pin = icon_button("◆", "고정 해제");
 
-    let picture = gtk::Picture::builder()
-        .hexpand(true)
-        .vexpand(true)
-        .can_shrink(true)
-        .focusable(true)
-        .build();
-    picture.set_alternative_text(Some("현재 만화 페이지"));
+    let picture = picture::Picture::new();
     let scroll = gtk::ScrolledWindow::builder()
         .hexpand(true)
         .vexpand(true)
         .child(&picture)
         .build();
-    scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Never);
+    // External policies keep oversized content scrollable without imposing a
+    // minimum window size or adding bars that change the image viewport.
+    scroll.set_policy(gtk::PolicyType::External, gtk::PolicyType::External);
     scroll.add_css_class("reader-scroll");
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let previous = icon_button("←", "이전 페이지");
@@ -1343,32 +1385,54 @@ fn build(
     metadata_label.set_margin_bottom(10);
     metadata_label.set_margin_start(12);
     metadata_label.set_margin_end(12);
-    let metadata_panel = gtk::ScrolledWindow::builder()
+    let metadata_scroll = gtk::ScrolledWindow::builder()
         .child(&metadata_label)
-        .halign(gtk::Align::End)
-        .valign(gtk::Align::Start)
-        .margin_end(12)
-        .margin_top(62)
-        .width_request(400)
         .max_content_height(300)
         .propagate_natural_height(true)
-        .visible(false)
         .focusable(false)
         .build();
-    metadata_panel.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    metadata_scroll.set_policy(gtk::PolicyType::Never, gtk::PolicyType::Automatic);
+    let copy = gtk::Button::from_icon_name("edit-copy-symbolic");
+    copy.set_tooltip_text(Some("메타데이터 복사"));
+    copy.update_property(&[gtk::accessible::Property::Label("메타데이터 복사")]);
+    copy.set_halign(gtk::Align::End);
+    copy.set_focus_on_click(false);
+    copy.set_margin_top(8);
+    copy.set_margin_end(8);
+    let metadata_panel = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    metadata_panel.set_halign(gtk::Align::End);
+    metadata_panel.set_valign(gtk::Align::Start);
+    metadata_panel.set_margin_end(12);
+    metadata_panel.set_margin_top(62);
+    metadata_panel.set_width_request(400);
+    metadata_panel.set_visible(false);
     metadata_panel.add_css_class("metadata-overlay");
+    metadata_panel.append(&copy);
+    metadata_panel.append(&metadata_scroll);
     let metadata_button = icon_button("ⓘ", "메타데이터 열기");
     metadata_button.set_focus_on_click(false);
     let info = gtk::Box::new(gtk::Orientation::Horizontal, 0);
     info.append(&metadata_button);
     info.set_margin_top(8);
+    let zoom_label = gtk::Label::new(None);
+    zoom_label.set_xalign(0.0);
+    zoom_label.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    zoom_label.set_lines(2);
+    zoom_label.set_max_width_chars(19);
+    let zoom_badge = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    zoom_badge.append(&zoom_label);
+    zoom_badge.set_valign(gtk::Align::Center);
+    zoom_badge.set_margin_end(4);
+    zoom_badge.set_can_target(false);
+    zoom_badge.set_visible(false);
+    toolbar.prepend(&zoom_badge);
     let css = gtk::CssProvider::new();
     css.load_from_data(
         ".metadata-overlay, .reader-bar { background: transparent; color: #edf3ff; border-radius: 12px; }
          .reader-bar { padding: 8px; }
-         .reader-bar button, .reader-bar dropdown button { background: rgba(173,197,233,0.12); color: #edf3ff; border: 1px solid rgba(190,210,244,0.18); border-radius: 8px; box-shadow: none; }
-         .reader-bar button:hover { background: rgba(173,197,233,0.26); }
-         .reader-bar button:active { background: rgba(173,197,233,0.36); }
+         .reader-bar button, .reader-bar dropdown button, .metadata-overlay button { background: rgba(173,197,233,0.12); color: #edf3ff; border: 1px solid rgba(190,210,244,0.18); border-radius: 8px; box-shadow: none; }
+         .reader-bar button:hover, .metadata-overlay button:hover { background: rgba(173,197,233,0.26); }
+         .reader-bar button:active, .metadata-overlay button:active { background: rgba(173,197,233,0.36); }
          .reader-bar button.info-active { background: rgba(115,175,248,0.35); border-color: rgba(173,208,255,0.65); }
          .reader-bar button:disabled { color: #9aa5bb; }
          .metadata-overlay viewport { background: transparent; }
@@ -1414,7 +1478,11 @@ fn build(
         metadata_label,
         metadata_panel,
         metadata_button,
+        zoom_label,
+        zoom_badge,
         window,
+        startup_image: Cell::new(false),
+        window_bounds: Cell::new((0, 0)),
         header,
         toolbar,
         animation_controls,
@@ -1440,7 +1508,6 @@ fn build(
         reader_view: Cell::new(ReaderView::default()),
         syncing: Cell::new(false),
         closing: Cell::new(false),
-        reload_timer: RefCell::new(None),
         page_loading: Cell::new(false),
         loading_timer: RefCell::new(None),
         animation_timer: RefCell::new(None),
@@ -1464,6 +1531,25 @@ fn build(
     });
     ui.update_navigation();
     ui.update_playback();
+    {
+        let weak = Rc::downgrade(&ui);
+        copy.connect_clicked(move |button| {
+            if let Some(ui) = weak.upgrade() {
+                let metadata = ui.metadata.borrow();
+                if metadata.visible() {
+                    button.clipboard().set_text(&metadata.text);
+                }
+            }
+        });
+    }
+    for adjustment in [ui.scroll.hadjustment(), ui.scroll.vadjustment()] {
+        let weak = Rc::downgrade(&ui);
+        adjustment.connect_page_size_notify(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                ui.update_zoom_badge();
+            }
+        });
+    }
     {
         let weak = Rc::downgrade(&ui);
         ui.metadata_button.connect_clicked(move |_| {
@@ -1850,7 +1936,8 @@ fn build(
                 }
                 return glib::Propagation::Stop;
             }
-            if ui.reader_view.get().zoom > 1.0 {
+            let view = ui.reader_view.get();
+            if !view.fit && view.zoom > 1.0 {
                 return glib::Propagation::Proceed;
             }
             let old = accumulated.get();
@@ -1871,7 +1958,7 @@ fn build(
             glib::Propagation::Stop
         });
     }
-    ui.picture.add_controller(wheel);
+    ui.scroll.add_controller(wheel);
 
     let drag = gtk::GestureDrag::new();
     let drag_origin = Rc::new(Cell::new((0.0, 0.0)));
@@ -1892,7 +1979,9 @@ fn build(
         let weak = Rc::downgrade(&ui);
         drag.connect_drag_update(move |_, dx, dy| {
             if let Some(ui) = weak.upgrade()
-                && ui.reader_view.get().zoom > 1.0
+                && !ui.reader_view.get().fit
+                && (ui.picture.width() > ui.scroll.width()
+                    || ui.picture.height() > ui.scroll.height())
             {
                 let (x, y) = drag_origin.get();
                 ui.scroll.hadjustment().set_value(x - dx);
@@ -1900,7 +1989,7 @@ fn build(
             }
         });
     }
-    ui.picture.add_controller(drag);
+    ui.scroll.add_controller(drag);
 
     // Prefer the file-list representation so count/locality can be validated,
     // while retaining GFile compatibility for sources offering a single file.
@@ -1997,6 +2086,8 @@ fn build(
                 if ui.closing.get() {
                     return glib::Propagation::Stop;
                 }
+                let (width, height) = ui.window.default_size();
+                window_size.set(WindowSize::new(width, height));
                 ui.close();
                 let started = std::time::Instant::now();
                 // Bounded shutdown-only check, not a steady-state result polling loop.
@@ -2024,11 +2115,52 @@ fn build(
             glib::timeout_future(Duration::from_millis(1)).await;
         }
     });
+    gtk::prelude::WidgetExt::realize(&ui.window);
+    if let Some(surface) = ui.window.surface() {
+        ui.picture.watch_surface_scale(&surface);
+        let weak = Rc::downgrade(&ui);
+        surface.connect_notify_local(
+            Some(if surface.find_property("scale").is_some() {
+                "scale"
+            } else {
+                "scale-factor"
+            }),
+            move |_, _| {
+                if let Some(ui) = weak.upgrade() {
+                    ui.update_zoom_badge();
+                }
+            },
+        );
+    }
+    if let Some(surface) = ui.window.surface()
+        && let Ok(toplevel) = surface.downcast::<gdk::Toplevel>()
+    {
+        let weak = Rc::downgrade(&ui);
+        toplevel.connect_compute_size(move |_, size| {
+            if let Some(ui) = weak.upgrade() {
+                let bounds = size.bounds();
+                let monitor = ui
+                    .window
+                    .surface()
+                    .and_then(|surface| surface.display().monitor_at_surface(&surface))
+                    .map(|monitor| monitor.geometry());
+                ui.window_bounds.set(monitor.map_or(bounds, |geometry| {
+                    (
+                        bounds.0.min(geometry.width()),
+                        bounds.1.min(geometry.height()),
+                    )
+                }));
+            }
+        });
+    }
     ui.window.present();
     ui.focus_viewer();
     if let Some(path) = initial {
         let ui = ui.clone();
-        glib::idle_add_local_once(move || ui.open(path));
+        glib::idle_add_local_once(move || {
+            ui.startup_image.set(true);
+            ui.open_file_impl(gio::File::for_commandline_arg(path), false);
+        });
     }
     if smoke {
         if smoke_empty {
@@ -2083,6 +2215,10 @@ pub fn run(resolve_network: network::Resolver) -> glib::ExitCode {
         first
     }
     .map(PathBuf::from);
+    // Read before entering the GUI loop, and persist after it exits.
+    let state_path = (!smoke).then(window_state::state_path).flatten();
+    let restored = state_path.as_deref().and_then(window_state::load);
+    let window_size = Rc::new(Cell::new(restored));
     let smoke_ok = Rc::new(Cell::new(false));
     let app = gtk::Application::builder()
         .application_id("io.github.ncatimage.Development")
@@ -2090,6 +2226,7 @@ pub fn run(resolve_network: network::Resolver) -> glib::ExitCode {
         .build();
     {
         let smoke_ok = smoke_ok.clone();
+        let window_size = window_size.clone();
         app.connect_activate(move |app| {
             build(
                 app,
@@ -2111,10 +2248,16 @@ pub fn run(resolve_network: network::Resolver) -> glib::ExitCode {
                 },
                 smoke_ok.clone(),
                 resolve_network,
+                window_size.clone(),
             )
         });
     }
     let result = app.run_with_args::<&str>(&[]);
+    if let (Some(path), Some(size)) = (state_path, window_size.get())
+        && window_state::save(&path, size).is_err()
+    {
+        eprintln!("nCatImage: could not save window size");
+    }
     if smoke && !smoke_ok.get() {
         glib::ExitCode::FAILURE
     } else {

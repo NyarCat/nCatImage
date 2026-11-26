@@ -62,6 +62,8 @@ def main():
             result = subprocess.run([str(image), *arguments], cwd=work, stdout=log,
                                     stderr=subprocess.STDOUT, timeout=120)
         assert result.returncode == expected, f"{arguments[0]}: exit {result.returncode}; inspect {log_path}"
+        if arguments[0] == "--smoke-window":
+            assert b"window_dpi_smoke=ok per_monitor_v2=true" in log_path.read_bytes(), log_path
         assert list(deployed.iterdir()) == [image], "runtime payload extracted"
         assert hashlib.sha256(image.read_bytes()).hexdigest() == before
         assert all(hashlib.sha256(p.read_bytes()).hexdigest() == digest for p, digest in sources.items())

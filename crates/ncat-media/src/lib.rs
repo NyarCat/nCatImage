@@ -402,6 +402,7 @@ impl Book {
         // M1 intentionally uses conservative full-decode admission. JPEG reduced decode is a later PoC.
         let output_size = rgba_len(max_width, max_height)
             .ok_or(Error::Limit)?
+            .min(rgba_len(width, height).ok_or(Error::Limit)?)
             .min(MAX_OUTPUT);
         let needed = decoder
             .total_bytes()

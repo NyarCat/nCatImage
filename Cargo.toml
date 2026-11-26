@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/ncat-core", "crates/ncat-protocol", "crates/ncat-platform", "crates/ncat-presentation", "crates/ncat-gtk", "crates/ncat-desktop", "crates/ncat-windows", "crates/ncat-media", "crates/ncat-worker", "crates/ncat-backend", "crates/ncat-linux"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.92"
 publish = false

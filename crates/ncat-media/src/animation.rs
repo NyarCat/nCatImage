@@ -36,9 +36,17 @@ fn admission(decoder: &impl ImageDecoder, view: RenderSpec, workspace: u64) -> R
         return Err(Error::Limit);
     }
     // Decoder canvas, disposal/previous canvas, frame, orientation/rotation and scaling.
-    let needed = rgba_len(w, h)
-        .and_then(|n| n.checked_mul(8))
-        .and_then(|n| n.checked_add(rgba_len(view.width, view.height)?.min(MAX_OUTPUT) * 2))
+    let canvas_bytes = rgba_len(w, h).ok_or(Error::Limit)?;
+    let needed = canvas_bytes
+        .checked_mul(8)
+        .and_then(|n| {
+            n.checked_add(
+                rgba_len(view.width, view.height)?
+                    .min(canvas_bytes)
+                    .min(MAX_OUTPUT)
+                    * 2,
+            )
+        })
         .and_then(|n| n.checked_add(ncat_protocol::DECODE_OVERHEAD))
         .ok_or(Error::Limit)?;
     if needed > workspace {

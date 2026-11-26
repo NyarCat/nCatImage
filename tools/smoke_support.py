@@ -25,20 +25,26 @@ def image_command(image, *args):
     return [str(image), *(["--appimage-extract-and-run"] if image.suffix == ".AppImage" else []), *map(str, args)]
 
 
+def solid_png(width, height, rgb, title=None):
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
+
+    raw = (b"\0" + bytes(rgb) * width) * height
+    return (b"\x89PNG\r\n\x1a\n"
+            + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+            + (chunk(b"tEXt", b"Title\0" + title.encode("latin-1")) if title else b"")
+            + chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b""))
+
+
 def fixtures(work):
     root = work / "DO-NOT-LOG-fixtures"
     root.mkdir()
     folder = root / "DO-NOT-LOG folder"
     folder.mkdir()
 
-    def chunk(kind, data):
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", binascii.crc32(kind + data) & 0xFFFFFFFF)
-
     pages = []
     for index, number in enumerate([1, 2, 10]):
-        raw = (b"\0" + bytes([60 + index * 60, 130, 180]) * 64) * 96
-        data = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", 64, 96, 8, 2, 0, 0, 0))
-        data += chunk(b"IDAT", zlib.compress(raw)) + chunk(b"IEND", b"")
+        data = solid_png(64, 96, [60 + index * 60, 130, 180])
         page = root / f"DO-NOT-LOG-page{number}.png"
         page.write_bytes(data)
         (folder / page.name).write_bytes(data)

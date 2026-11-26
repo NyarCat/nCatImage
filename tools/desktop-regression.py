@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """Isolated X11 key/mouse, drop, mock network, cancellation and privacy checks."""
+import json
 import os
 import subprocess
 import time
@@ -10,7 +11,7 @@ gi.require_version("Gdk", "4.0")
 from gi.repository import Gdk, Gio, GLib, Gtk
 import pyatspi
 
-from smoke_support import arguments, check_privacy, fixtures, image_command, work_directory
+from smoke_support import arguments, check_privacy, fixtures, image_command, solid_png, work_directory
 
 
 def main():
@@ -111,11 +112,28 @@ def main():
         check_privacy(text)
         return text
 
-    def launch(label, uri=None):
+    def launch(label, uri=None, state_home=None):
         directory = work / label
         directory.mkdir()
         argv = [str(uri)] if uri else []
-        return subprocess.Popen(image_command(args.image, *argv), cwd=directory), directory
+        env = {**os.environ, "XDG_STATE_HOME": str(state_home or directory / "state")}
+        return subprocess.Popen(image_command(args.image, *argv), cwd=directory, env=env), directory
+
+    def dimensions(node):
+        area = node.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
+        return area.x, area.y, area.width, area.height
+
+    def client_size(win):
+        geometry = dict(line.split("=", 1) for line in command(
+            "xdotool", "getwindowgeometry", "--shell", win
+        ).splitlines())
+        return int(geometry["WIDTH"]), int(geometry["HEIGHT"])
+
+    def zoom_label(text):
+        return next((node for node in showing("label") if node.name == text), None)
+
+    def copy_button():
+        return next((node for node in showing("push button") if node.name == "메타데이터 복사"), None)
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     reply = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName",
@@ -143,6 +161,69 @@ def main():
     try:
         wait(lambda: "window id #" in command("xprop", "-root", "_NET_SUPPORTING_WM_CHECK"),
              "window manager readiness")
+        state_home = work / "window-state"
+        state_file = state_home / "ncatimage/window-state.json"
+        state_file.parent.mkdir(parents=True)
+        state_file.write_text('{"width":800,"height":540}')
+        size_fixtures = work / "window-size-fixtures"
+        size_fixtures.mkdir()
+        original = size_fixtures / "page1.png"
+        original.write_bytes(solid_png(930, 400, (60, 130, 180), "Copy <literal>\nSecond line"))
+        (size_fixtures / "page2.png").write_bytes(solid_png(1150, 700, (60, 180, 130)))
+        app, directory = launch("window-size", original, state_home)
+        win = window()
+        activate(win)
+        wait(lambda: "930×400" in command("xdotool", "getwindowname", win), "first native page")
+        wait(lambda: client_size(win) == (930, 540), "startup grows only the required width")
+        wait(lambda: showing("image") and dimensions(showing("image")[0]) == (0, 70, 930, 400),
+             "center the page in the remaining vertical space")
+        badge = wait(lambda: zoom_label("100%\n930 × 400 px"), "native zoom label")
+        smaller = wait(lambda: next((node for node in showing("push button") if node.name in ["축소", "−"]), None),
+                       "zoom out button")
+        bx, by, bw, bh = dimensions(badge)
+        sx, sy, _, sh = dimensions(smaller)
+        assert bx + bw <= sx and by < sy + sh and sy < by + bh, "zoom label belongs to the left of zoom controls"
+        assert not copy_button(), "the copy button is hidden when metadata is closed"
+        key("Tab")
+        copy = wait(copy_button, "metadata copy button")
+        x, y, w, h = dimensions(copy)
+        click(win, x + w // 2, y + h // 2)
+        clipboard = Gdk.Display.get_default().get_clipboard()
+        copied = []
+        clipboard.read_text_async(None, lambda cb, result: copied.append(cb.read_text_finish(result)))
+        wait(lambda: copied, "read clipboard after clicking copy")
+        assert copied == ["Title: Copy <literal>\nSecond line"], copied
+        key("plus")
+        wait(lambda: zoom_label("125%\n1163 × 500 px"), "zoomed dimensions")
+        subprocess.run(["xdotool", "windowsize", win, "800", "360"], check=True)
+        wait(lambda: client_size(win) == (800, 360), "manual smaller viewport")
+        assert dimensions(showing("image")[0]) == (0, 0, 1163, 500)
+        key("Down")
+        wait(lambda: "1150×700" in command("xdotool", "getwindowname", win), "second native page")
+        assert client_size(win) == (800, 360), "later page must not grow the window"
+        assert dimensions(showing("image")[0]) == (0, 0, 1150, 700)
+        assert not copy_button(), "copy button must not retain previous page metadata"
+        key("9")
+        wait(lambda: dimensions(showing("image")[0])[2:] == (800, 360), "explicit fit fills the viewport widget")
+        wait(lambda: zoom_label("51.4%\n591 × 360 px"), "fit zoom label")
+        key("F11")
+        wait(lambda: "_NET_WM_STATE_FULLSCREEN" in command("xprop", "-id", win, "_NET_WM_STATE"),
+             "enter fullscreen before saving normal size")
+        key("Escape")
+        wait(lambda: app.poll() is not None, "exit and save normal size")
+        assert app.returncode == 0
+        assert json.loads(state_file.read_text()) == {"width": 800, "height": 360}
+        app, directory = launch("window-size-restored", inputs["last"], state_home)
+        win = window()
+        activate(win)
+        wait(lambda: "64×96" in command("xdotool", "getwindowname", win), "small startup image")
+        assert client_size(win) == (800, 360), "small startup image must not resize the restored window"
+        assert dimensions(showing("image")[0]) == (368, 132, 64, 96), "small page is centered"
+        key("Escape")
+        wait(lambda: app.poll() is not None, "restored viewer exits")
+        assert app.returncode == 0
+        print("PASS zoom badge, metadata copy, startup growth, clipping and normal-size restoration")
+
         app, directory = launch("ui", inputs["book"])
         win = window()
         activate(win)

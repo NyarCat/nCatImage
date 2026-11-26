@@ -8,3 +8,6 @@ publish.workspace = true
 [dependencies]
 ncat-protocol.workspace = true
 ncat-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
