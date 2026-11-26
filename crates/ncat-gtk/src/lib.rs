@@ -6,7 +6,8 @@ mod picture;
 
 use gtk::{gdk, gio, glib, prelude::*};
 use ncat_backend::{
-    Backend, Book, DropEvent, DropRejection, Event, FrameBytes, NetworkFailure, View, worker_path,
+    Backend, Book, Deletion, DropEvent, DropRejection, Event, FrameBytes, NetworkFailure, View,
+    worker_path,
 };
 use ncat_core::Direction;
 use ncat_presentation::playback::Playback;
@@ -36,6 +37,7 @@ struct Ui {
     metadata_label: gtk::Label,
     metadata_panel: gtk::Box,
     metadata_button: gtk::Button,
+    metadata_toggle_bar: gtk::Box,
     zoom_label: gtk::Label,
     zoom_badge: gtk::Box,
     window: gtk::ApplicationWindow,
@@ -56,7 +58,8 @@ struct Ui {
     picture: picture::Picture,
     scroll: gtk::ScrolledWindow,
     status: RefCell<String>,
-    position: gtk::SpinButton,
+    position: gtk::Entry,
+    page_go: gtk::Button,
     previous: gtk::Button,
     next: gtk::Button,
     direction_button: gtk::ToggleButton,
@@ -64,9 +67,11 @@ struct Ui {
     book: RefCell<Option<Arc<Book>>>,
     selected: Cell<usize>,
     reader_view: Cell<ReaderView>,
-    syncing: Cell<bool>,
     closing: Cell<bool>,
     page_loading: Cell<bool>,
+    deletion_pending: Cell<bool>,
+    delete_key_down: Cell<bool>,
+    skip_delete_confirmation: Cell<bool>,
     loading_timer: RefCell<Option<glib::SourceId>>,
     animation_timer: RefCell<Option<glib::SourceId>>,
     animation_view: Cell<View>,
@@ -446,6 +451,8 @@ impl Ui {
         }
         self.animation_controls
             .set_visible(bars.visible(Bar::Bottom, editing) && self.playback.get().active);
+        self.metadata_toggle_bar
+            .set_visible(bars.visible(Bar::Top, editing));
         self.glass.queue_draw();
     }
 
@@ -749,7 +756,6 @@ impl Ui {
     }
 
     fn update_navigation(&self) {
-        self.syncing.set(true);
         let book = self.book.borrow();
         let len = book
             .as_ref()
@@ -760,11 +766,11 @@ impl Ui {
         self.next
             .set_sensitive(len > 0 && self.selected.get() + 1 < len);
         self.position.set_sensitive(len > 0);
-        self.position.set_range(1.0, len.max(1) as f64);
-        self.position.set_value((self.selected.get() + 1) as f64);
+        self.page_go.set_sensitive(len > 0);
+        self.position
+            .set_text(&(self.selected.get() + 1).to_string());
         drop(book);
         self.update_title();
-        self.syncing.set(false);
     }
 
     fn set_status(&self, text: &str) {
@@ -835,6 +841,159 @@ impl Ui {
         self.reader_view.set(state);
         self.reset_pan();
         self.layout_picture();
+    }
+
+    fn delete_page(self: &Rc<Self>) {
+        if self.page_loading.get()
+            || self.deletion_pending.get()
+            || self.picture.texture().is_none()
+        {
+            return;
+        }
+        let target = self
+            .book
+            .borrow()
+            .as_ref()
+            .filter(|book| book.complete)
+            .and_then(|book| book.deletion(self.selected.get()));
+        let (path, name, next) = match target {
+            Some(Deletion::File { path, name, next }) => (path, name, next),
+            Some(Deletion::Archive) => {
+                gtk::AlertDialog::builder()
+                    .message("압축 파일이라 삭제 불가능합니다")
+                    .modal(true)
+                    .build()
+                    .show(Some(&self.window));
+                return;
+            }
+            None => return,
+        };
+        self.deletion_pending.set(true);
+        if self.skip_delete_confirmation.get() {
+            self.trash_page(path, next);
+            return;
+        }
+        let check = gtk::CheckButton::with_label("다시 묻지 않기");
+        let cancel = gtk::Button::with_label("취소");
+        let delete = gtk::Button::with_label("삭제");
+        delete.add_css_class("destructive-action");
+        let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        actions.set_halign(gtk::Align::End);
+        actions.append(&cancel);
+        actions.append(&delete);
+        let content = gtk::Box::new(gtk::Orientation::Vertical, 12);
+        content.set_margin_top(16);
+        content.set_margin_bottom(16);
+        content.set_margin_start(16);
+        content.set_margin_end(16);
+        let message = gtk::Label::new(Some(&format!("{name}\n휴지통으로 이동합니다.")));
+        message.set_wrap(true);
+        message.set_max_width_chars(52);
+        content.append(&message);
+        content.append(&check);
+        content.append(&actions);
+        let dialog = gtk::Window::builder()
+            .title("삭제하시겠습니까?")
+            .transient_for(&self.window)
+            .modal(true)
+            .destroy_with_parent(true)
+            .child(&content)
+            .build();
+        dialog.set_application(self.window.application().as_ref());
+        dialog.set_default_widget(Some(&cancel));
+        let weak = Rc::downgrade(self);
+        let confirmed = Rc::new(Cell::new(false));
+        let closed = confirmed.clone();
+        dialog.connect_close_request(move |_| {
+            if !closed.get()
+                && let Some(ui) = weak.upgrade()
+            {
+                ui.deletion_pending.set(false);
+            }
+            glib::Propagation::Proceed
+        });
+        let window = dialog.downgrade();
+        cancel.connect_clicked(move |_| {
+            if let Some(window) = window.upgrade() {
+                window.close();
+            }
+        });
+        let keys = gtk::EventControllerKey::new();
+        let window = dialog.downgrade();
+        keys.connect_key_pressed(move |_, key, _, _| {
+            if key != gdk::Key::Escape {
+                return glib::Propagation::Proceed;
+            }
+            if let Some(window) = window.upgrade() {
+                window.close();
+            }
+            glib::Propagation::Stop
+        });
+        dialog.add_controller(keys);
+        let weak = Rc::downgrade(self);
+        let window = dialog.downgrade();
+        delete.connect_clicked(move |_| {
+            if let Some(ui) = weak.upgrade() {
+                confirmed.set(true);
+                ui.skip_delete_confirmation.set(check.is_active());
+                ui.trash_page(path.clone(), next.clone());
+            }
+            if let Some(window) = window.upgrade() {
+                window.close();
+            }
+        });
+        dialog.present();
+        cancel.grab_focus();
+    }
+
+    fn trash_page(self: &Rc<Self>, path: PathBuf, next: Option<PathBuf>) {
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let file = gio::File::for_path(&path);
+            let regular = file
+                .query_info_future(
+                    "standard::type",
+                    gio::FileQueryInfoFlags::NOFOLLOW_SYMLINKS,
+                    glib::Priority::DEFAULT,
+                )
+                .await
+                .is_ok_and(|info| info.file_type() == gio::FileType::Regular);
+            let ok = regular && file.trash_future(glib::Priority::DEFAULT).await.is_ok();
+            let Some(ui) = weak.upgrade() else { return };
+            ui.deletion_pending.set(false);
+            if ui.closing.get() {
+                return;
+            }
+            if !ok {
+                gtk::AlertDialog::builder()
+                    .message("이미지를 휴지통으로 이동할 수 없습니다")
+                    .modal(true)
+                    .build()
+                    .show(Some(&ui.window));
+                return;
+            }
+            let reopen = ui
+                .book
+                .borrow()
+                .as_ref()
+                .and_then(|book| book.after_deletion(ui.selected.get(), &path, next));
+            let Some(reopen) = reopen else { return };
+            if let Some(next) = reopen {
+                ui.open_source(next, false);
+            } else {
+                ui.cancel_reload();
+                ui.backend.cancel();
+                ui.book.borrow_mut().take();
+                ui.selected.set(0);
+                ui.page_loading.set(false);
+                ui.picture.set_texture(None);
+                ui.update_zoom_badge();
+                ui.clear_metadata();
+                ui.reset_playback(true);
+                ui.set_status("이미지를 휴지통으로 이동했습니다");
+                ui.update_navigation();
+            }
+        });
     }
 
     fn rotate(self: &Rc<Self>, backwards: bool) {
@@ -1324,9 +1483,14 @@ fn build(
     let toolbar = gtk::Box::new(gtk::Orientation::Horizontal, 6);
     let previous = icon_button("←", "이전 페이지");
     let next = icon_button("→", "다음 페이지");
-    let position = gtk::SpinButton::with_range(1.0, 1.0, 1.0);
-    position.set_numeric(true);
-    position.set_width_chars(6);
+    let position = gtk::Entry::builder()
+        .input_purpose(gtk::InputPurpose::Digits)
+        .width_chars(6)
+        .build();
+    position.set_tooltip_text(Some("페이지 번호 · Enter로 이동"));
+    position.update_property(&[gtk::accessible::Property::Label("페이지 번호")]);
+    let page_go = icon_button("▾", "페이지 이동");
+    page_go.set_focus_on_click(false);
     let smaller = icon_button("−", "축소");
     let fit = icon_button("⊡", "맞춤");
     let larger = icon_button("+", "확대");
@@ -1335,6 +1499,7 @@ fn build(
     for widget in [
         previous.upcast_ref::<gtk::Widget>(),
         position.upcast_ref(),
+        page_go.upcast_ref(),
         next.upcast_ref(),
         direction.upcast_ref(),
         top_pin.upcast_ref(),
@@ -1478,6 +1643,7 @@ fn build(
         metadata_label,
         metadata_panel,
         metadata_button,
+        metadata_toggle_bar: info,
         zoom_label,
         zoom_badge,
         window,
@@ -1499,6 +1665,7 @@ fn build(
         scroll,
         status: RefCell::new("우클릭: 열기".into()),
         position,
+        page_go,
         previous,
         next,
         direction_button: direction,
@@ -1506,9 +1673,11 @@ fn build(
         book: RefCell::new(None),
         selected: Cell::new(0),
         reader_view: Cell::new(ReaderView::default()),
-        syncing: Cell::new(false),
         closing: Cell::new(false),
         page_loading: Cell::new(false),
+        deletion_pending: Cell::new(false),
+        delete_key_down: Cell::new(false),
+        skip_delete_confirmation: Cell::new(false),
         loading_timer: RefCell::new(None),
         animation_timer: RefCell::new(None),
         animation_view: Cell::new(View::default()),
@@ -1712,7 +1881,7 @@ fn build(
     });
     overlay.add_controller(keys);
     // Only an explicit pointer click opts controls into keyboard input. Merely
-    // showing/restoring a window or pressing Tab must not focus the page spin.
+    // Showing/restoring a window or pressing Tab must not focus the page field.
     for widget in [
         ui.header.upcast_ref::<gtk::Widget>(),
         ui.toolbar.upcast_ref(),
@@ -1810,12 +1979,28 @@ fn build(
         });
     }
     {
+        let position = ui.position.downgrade();
+        ui.page_go.connect_clicked(move |_| {
+            if let Some(position) = position.upgrade() {
+                position.emit_activate();
+            }
+        });
         let weak = Rc::downgrade(&ui);
-        ui.position.connect_value_changed(move |position| {
-            if let Some(ui) = weak.upgrade()
-                && !ui.syncing.get()
+        ui.position.connect_activate(move |position| {
+            let Some(ui) = weak.upgrade() else { return };
+            let len = ui
+                .book
+                .borrow()
+                .as_ref()
+                .filter(|book| book.complete)
+                .map_or(0, |book| book.pages.len());
+            if let Ok(page) = position.text().trim().parse::<usize>()
+                && (1..=len).contains(&page)
+                && page - 1 != ui.selected.get()
             {
-                ui.load(position.value_as_int().saturating_sub(1) as usize);
+                ui.load(page - 1);
+            } else {
+                ui.update_navigation();
             }
         });
     }
@@ -1850,6 +2035,11 @@ fn build(
                 Command::Native => return glib::Propagation::Proceed,
                 Command::Block => {}
                 Command::ToggleMetadata => ui.toggle_metadata(),
+                Command::Delete => {
+                    if !ui.delete_key_down.replace(true) {
+                        ui.delete_page();
+                    }
+                }
                 Command::Open { folder } => ui.dialog(folder),
                 Command::Network => ui.network_dialog(),
                 Command::Quit => ui.window.close(),
@@ -1916,6 +2106,20 @@ fn build(
             glib::Propagation::Stop
         });
     }
+    let weak = Rc::downgrade(&ui);
+    keys.connect_key_released(move |_, key, _, _| {
+        if matches!(key, gdk::Key::Delete | gdk::Key::KP_Delete)
+            && let Some(ui) = weak.upgrade()
+        {
+            ui.delete_key_down.set(false);
+        }
+    });
+    let weak = Rc::downgrade(&ui);
+    ui.window.connect_is_active_notify(move |_| {
+        if let Some(ui) = weak.upgrade() {
+            ui.delete_key_down.set(false);
+        }
+    });
     ui.window.add_controller(keys);
 
     let wheel = gtk::EventControllerScroll::new(gtk::EventControllerScrollFlags::VERTICAL);

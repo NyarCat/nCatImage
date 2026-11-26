@@ -26,10 +26,11 @@ pub enum Key {
     Rotate,
     Direction,
     Reload,
+    Delete,
     Other,
 }
 
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Modifiers {
     pub primary: bool,
     pub shift: bool,
@@ -60,6 +61,7 @@ pub enum Command {
     Rotate { backwards: bool },
     Direction,
     Reload,
+    Delete,
 }
 
 pub fn command(key: Key, modifiers: Modifiers, controls_have_input: bool) -> Command {
@@ -101,6 +103,13 @@ pub fn command(key: Key, modifiers: Modifiers, controls_have_input: bool) -> Com
     if controls_have_input {
         return C::Native;
     }
+    if key == K::Delete {
+        return if modifiers == Modifiers::default() {
+            C::Delete
+        } else {
+            C::Native
+        };
+    }
     if modifiers.primary || modifiers.alternate || modifiers.system {
         return C::Native;
     }
@@ -129,6 +138,23 @@ pub fn command(key: Key, modifiers: Modifiers, controls_have_input: bool) -> Com
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn delete_only_applies_to_the_viewer_without_modifiers() {
+        let plain = Modifiers::default();
+        assert_eq!(command(Key::Delete, plain, false), Command::Delete);
+        assert_eq!(command(Key::Delete, plain, true), Command::Native);
+        assert_eq!(
+            command(
+                Key::Delete,
+                Modifiers {
+                    shift: true,
+                    ..plain
+                },
+                false
+            ),
+            Command::Native
+        );
+    }
     #[test]
     fn brackets_navigate_books_only_when_reading_without_modifiers() {
         for (key, forward) in [(Key::BookPrevious, false), (Key::BookNext, true)] {

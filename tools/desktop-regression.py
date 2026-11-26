@@ -82,11 +82,15 @@ def main():
         subprocess.run(["xdotool", "mousemove", "--window", win, str(x), str(y), "click", "1"], check=True)
         pump(.13)
 
-    def click_spin(win):
-        spin = showing("spin button")[0]
+    def page_field():
+        return next((node for node in showing("text")
+                     if node.getState().contains(pyatspi.STATE_EDITABLE)), None)
+
+    def click_page_field(win):
         # Window-relative AT-SPI coordinates avoid GTK's unsupported screen
         # origins and account for client-side decorations and font metrics.
-        bounds = spin.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
+        field = wait(page_field, "page number field")
+        bounds = field.queryComponent().getExtents(pyatspi.WINDOW_COORDS)
         click(win, bounds.x + bounds.width // 3, bounds.y + bounds.height // 2)
 
     def log_snapshot(win, directory):
@@ -112,11 +116,13 @@ def main():
         check_privacy(text)
         return text
 
-    def launch(label, uri=None, state_home=None):
+    def launch(label, uri=None, state_home=None, data_home=None):
         directory = work / label
         directory.mkdir()
         argv = [str(uri)] if uri else []
         env = {**os.environ, "XDG_STATE_HOME": str(state_home or directory / "state")}
+        if data_home is not None:
+            env["XDG_DATA_HOME"] = str(data_home)
         return subprocess.Popen(image_command(args.image, *argv), cwd=directory, env=env), directory
 
     def dimensions(node):
@@ -134,6 +140,19 @@ def main():
 
     def copy_button():
         return next((node for node in showing("push button") if node.name == "메타데이터 복사"), None)
+
+    def info_button():
+        return next((node for node in showing("push button")
+                     if node.name in ["ⓘ", "메타데이터 열기", "메타데이터 닫기"]), None)
+
+    def delete_dialog():
+        return next((node for node in nodes() if node.name == "삭제하시겠습니까?"
+                     and node.getRoleName() in ["frame", "dialog"]), None)
+
+    def click_accessible(name, win, role):
+        node = wait(lambda: next((node for node in showing(role) if node.name == name), None), name)
+        x, y, w, h = dimensions(node)
+        click(win, x + w // 2, y + h // 2)
 
     bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
     reply = bus.call_sync("org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "RequestName",
@@ -193,6 +212,12 @@ def main():
         clipboard.read_text_async(None, lambda cb, result: copied.append(cb.read_text_finish(result)))
         wait(lambda: copied, "read clipboard after clicking copy")
         assert copied == ["Title: Copy <literal>\nSecond line"], copied
+        subprocess.run(["xdotool", "mousemove", "--window", win, "400", "320"], check=True)
+        key("grave")
+        wait(lambda: not info_button() and not page_field(), "hide metadata toggle with top controls")
+        assert copy_button(), "an already-open metadata panel stays visible"
+        key("grave")
+        wait(info_button, "restore metadata toggle with top controls")
         key("plus")
         wait(lambda: zoom_label("125%\n1163 × 500 px"), "zoomed dimensions")
         subprocess.run(["xdotool", "windowsize", win, "800", "360"], check=True)
@@ -233,7 +258,8 @@ def main():
         text = log_snapshot(win, directory)
         assert "backend_ready" in text and "Ready { wayland: false }" in text
         print("PASS context menu log viewer, read-only text, and no log files")
-        wait(lambda: showing("spin button"), "accessible controls")
+        wait(page_field, "accessible page number field")
+        assert not showing("spin button"), "page field must not have duplicate steppers"
         for press, target in [("Down", 2), ("Up", 1), ("space", 2), ("BackSpace", 1), ("Next", 2), ("Prior", 1), ("Tab", 1), ("Down", 2), ("Up", 1)]:
             key(press)
             page(target)
@@ -241,12 +267,21 @@ def main():
         for press, target in [("Down", 2), ("Up", 1), ("Left", 2), ("Right", 1)]:
             key(press)
             page(target)
-        click_spin(win)
+        click_page_field(win)
         key("ctrl+a")
         key("2")
+        page(1)
         key("Return")
         page(2)
         key("Up")
+        page(2)
+        key("ctrl+a")
+        key("3")
+        page(2)
+        jump = wait(lambda: next((node for node in showing("push button")
+                                 if node.name in ["페이지 이동", "▾"]), None), "page jump button")
+        x, y, w, h = dimensions(jump)
+        click(win, x + w // 2, y + h // 2)
         page(3)
         click(win, 500, 450)
         key("Up")
@@ -257,29 +292,96 @@ def main():
 
         normal_size = image_size()
         key("grave")
-        wait(lambda: not showing("spin button"), "unpin interface")
+        wait(lambda: not page_field() and not info_button(), "unpin interface")
         assert image_size() == normal_size, "overlays must not resize the image area"
         key("grave")
-        wait(lambda: showing("spin button"), "pin interface")
+        wait(lambda: page_field() and info_button(), "pin interface")
 
         def fullscreen():
             return "_NET_WM_STATE_FULLSCREEN" in command("xprop", "-id", win, "_NET_WM_STATE")
 
         key("F11")
         wait(fullscreen, "fullscreen")
-        assert showing("spin button"), "pinned controls remain visible in fullscreen"
+        assert page_field() and info_button(), "pinned controls remain visible in fullscreen"
         key("grave")
-        wait(lambda: not showing("spin button"), "unpin in fullscreen")
+        wait(lambda: not page_field() and not info_button(), "unpin in fullscreen")
         key("F11")
         wait(lambda: not fullscreen(), "windowed restore")
-        assert not showing("spin button"), "unpinned controls stay unpinned after fullscreen"
+        assert not page_field() and not info_button(), "unpinned controls stay unpinned after fullscreen"
         key("grave")
-        wait(lambda: showing("spin button"), "pin again")
-        click_spin(win)
+        wait(lambda: page_field() and info_button(), "pin again")
+        click_page_field(win)
         key("Escape")
         wait(lambda: app.poll() is not None, "exit while editing")
         assert app.returncode == 0
         print("PASS keyboard, explicit focus, top UI visibility and fullscreen restoration")
+
+        trash_space = work / "private-trash"
+        trash_space.mkdir()
+        delete_files = work / "delete-fixtures"
+        delete_files.mkdir()
+        originals = [delete_files / f"page{i}.png" for i in range(1, 4)]
+        for path in originals:
+            path.write_bytes(inputs["last"].read_bytes())
+        app, directory = launch("delete", originals[0], data_home=trash_space)
+        win = window()
+        activate(win)
+        wait(lambda: "page1.png · Png" in command("xdotool", "getwindowname", win), "delete source")
+        key("Delete")
+        wait(delete_dialog, "first deletion confirmation")
+        dlg = wait(lambda: command("xdotool", "search", "--onlyvisible", "--name",
+                                   "^삭제하시겠습니까").splitlines()[-1], "delete dialog X11 window")
+        click_accessible("다시 묻지 않기", dlg, "check box")
+        key("Escape")
+        wait(lambda: not delete_dialog(), "cancel deletion")
+        assert originals[0].is_file()
+        activate(win)
+        key("Delete")
+        wait(delete_dialog, "cancel did not save the checkbox")
+        dlg = wait(lambda: command("xdotool", "search", "--onlyvisible", "--name",
+                                   "^삭제하시겠습니까").splitlines()[-1], "delete dialog again")
+        click_accessible("다시 묻지 않기", dlg, "check box")
+        click_accessible("삭제", dlg, "push button")
+        wait(lambda: not originals[0].exists(), "first source moved")
+        wait(lambda: "page2.png · Png" in command("xdotool", "getwindowname", win), "display next source")
+        activate(win)
+        subprocess.run(["xdotool", "keydown", "Delete"], check=True)
+        try:
+            wait(lambda: not originals[1].exists(), "no repeat confirmation this session")
+            pump(1.4)
+            assert originals[2].is_file(), "holding Del must not delete the following page"
+        finally:
+            subprocess.run(["xdotool", "keyup", "Delete"], check=True)
+        assert not delete_dialog()
+        for path in originals[:2]:
+            assert (trash_space / "Trash/files" / path.name).read_bytes() == inputs["last"].read_bytes()
+        key("Escape")
+        wait(lambda: app.poll() is not None, "quit delete session")
+        assert originals[2].is_file()
+        app, directory = launch("delete-reset", originals[2], data_home=trash_space)
+        win = window()
+        activate(win)
+        wait(lambda: "page3.png · Png" in command("xdotool", "getwindowname", win), "remaining source")
+        key("Delete")
+        wait(delete_dialog, "confirmation resets in a new process")
+        key("Escape")
+        activate(win)
+        key("Escape")
+        wait(lambda: app.poll() is not None, "quit new delete session")
+        assert originals[2].is_file()
+        book_bytes = inputs["book"].read_bytes()
+        app, directory = launch("delete-archive", inputs["book"], data_home=trash_space)
+        win = window()
+        activate(win)
+        page(1)
+        key("Delete")
+        wait(lambda: any("압축 파일이라 삭제 불가능합니다" in node.name for node in nodes()), "archive warning")
+        assert not delete_dialog() and inputs["book"].read_bytes() == book_bytes
+        key("Escape")
+        activate(win)
+        key("Escape")
+        wait(lambda: app.poll() is not None, "quit archive session")
+        print("PASS delete confirmation, session reset, trash contents and archive warning")
 
         damaged = work / "damaged-pages"
         damaged.mkdir()

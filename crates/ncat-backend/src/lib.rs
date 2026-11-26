@@ -18,7 +18,7 @@ use ncat_protocol::{
 };
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Stdio};
 use std::sync::{
     Arc, Condvar, Mutex,
@@ -56,6 +56,60 @@ pub struct Book {
     index_permit: Arc<Permit>,
     epoch: u64,
     source_revision: Option<Revision>,
+}
+
+pub enum Deletion {
+    Archive,
+    File {
+        path: PathBuf,
+        name: String,
+        next: Option<PathBuf>,
+    },
+}
+
+impl Book {
+    pub fn deletion(&self, index: usize) -> Option<Deletion> {
+        let page = self.pages.get(index)?;
+        let ncat_protocol::PageKey::File(path) = &page.key else {
+            return Some(Deletion::Archive);
+        };
+        let next = self
+            .pages
+            .get(index + 1)
+            .or_else(|| {
+                index
+                    .checked_sub(1)
+                    .and_then(|previous| self.pages.get(previous))
+            })
+            .and_then(|page| match &page.key {
+                ncat_protocol::PageKey::File(path) => Some(path.path()),
+                ncat_protocol::PageKey::Zip(_) => None,
+            });
+        Some(Deletion::File {
+            path: path.path(),
+            name: page.name.clone(),
+            next,
+        })
+    }
+
+    /// `None` leaves an unrelated book alone; `Some(None)` clears the last image.
+    pub fn after_deletion(
+        &self,
+        selected: usize,
+        removed: &Path,
+        next: Option<PathBuf>,
+    ) -> Option<Option<PathBuf>> {
+        let current = match &self.pages.get(selected)?.key {
+            ncat_protocol::PageKey::File(path) => path.path(),
+            ncat_protocol::PageKey::Zip(_) => return None,
+        };
+        if current == removed {
+            return Some(next);
+        }
+        self.pages.iter()
+            .any(|page| matches!(&page.key, ncat_protocol::PageKey::File(path) if path.path() == removed))
+            .then_some(Some(current))
+    }
 }
 
 #[derive(Debug)]

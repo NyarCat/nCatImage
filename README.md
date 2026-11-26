@@ -2,11 +2,16 @@
 
 **가볍게 열고, 빠르게 넘기는 Rust 기반 로컬 코믹뷰어.**
 
-폴더와 ZIP/CBZ를 바로 열어 이미지를 감상하는 Linux용 뷰어입니다. 로컬 파일과 OS가 연결하는 SMB·FTP·SFTP 네트워크 폴더를 읽을 수 있습니다. 원본 파일을 변경하지 않으며, 자동 원격 분석이나 감상 기록 저장 없이 동작합니다.
+폴더와 ZIP/CBZ를 바로 열어 이미지를 감상하는 Linux용 뷰어입니다. 로컬 파일과 OS가 연결하는 SMB·FTP·SFTP 네트워크 폴더를 읽을 수 있습니다. 감상 중 원본을 수정하지 않으며, 명시적인 `Del` 조작으로만 일반 이미지 파일을 휴지통으로 보낼 수 있습니다. 자동 원격 분석이나 감상 기록 저장 없이 동작합니다.
 
-> **v0.6.2 개발 프리뷰** — Linux x64 AppImage와 미서명 Windows x64 `UNTESTED` 단일 EXE. Windows 네이티브 검증과 정식 제품 배포는 미완료입니다.
+> **v0.6.3 개발 프리뷰** — Linux x64 AppImage와 미서명 Windows x64 `UNTESTED` 단일 EXE. Windows 네이티브 검증과 정식 제품 배포는 미완료입니다.
 
 **이 프로젝트는 OpenCode 코딩 에이전트(Coding Agent)를 통한 AI 기반 개발 프로젝트입니다.** 설계·구현·테스트·문서에 AI가 생성하거나 수정한 내용이 포함되어 있습니다. 자동 검사 통과가 안전성·정확성·성능을 보장하는 것은 아니며, 실제 검증 범위와 남은 제한을 공개합니다.
+
+### v0.6.3 변경 사항
+
+- 페이지 번호 칸의 중복 `+`·`−`를 없앴습니다. 번호를 입력한 뒤 `Enter` 또는 오른쪽 `▾`로 바로 이동합니다. 상단 UI를 숨기면 `ⓘ`도 함께 숨겨지며, 이미 열린 메타데이터 패널은 그대로 유지됩니다.
+- `Del`은 확인 후 현재 일반 이미지를 OS 휴지통으로 보냅니다. **다시 묻지 않기**는 삭제를 확인한 경우에만 현재 실행 동안 적용됩니다. ZIP/CBZ 내부 이미지에는 경고만 표시하며, 휴지통을 사용할 수 없으면 영구 삭제하지 않습니다.
 
 ### v0.6.2 변경 사항
 
@@ -68,16 +73,16 @@
 
 ## 다운로드 및 실행
 
-[**v0.6.2 다운로드 — Linux AppImage · Windows UNTESTED EXE**](https://github.com/NyarCat/nCatImage/releases/tag/v0.6.2)
+[**v0.6.3 다운로드 — Linux AppImage · Windows UNTESTED EXE**](https://github.com/NyarCat/nCatImage/releases/tag/v0.6.3)
 
-Windows는 `nCatImage-0.6.2-UNTESTED-windows-x86_64.exe`입니다. 모니터별 DPI 인식을 지원하는 Windows 10(1703 이상)·11용 미서명 프리뷰입니다. 네이티브 CI의 `private owner/DACL required` 오류는 해결되지 않았습니다.
+Windows는 `nCatImage-0.6.3-UNTESTED-windows-x86_64.exe`입니다. 모니터별 DPI 인식을 지원하는 Windows 10(1703 이상)·11용 미서명 프리뷰입니다. 네이티브 CI의 `private owner/DACL required` 오류는 해결되지 않았습니다.
 
 GTK와 이미지 처리 worker를 포함한 **AppImage 파일 하나**로 배포합니다. Rust나 GTK 개발 패키지를 따로 설치할 필요가 없습니다.
 
 ```bash
-chmod +x nCatImage-0.6.2-x86_64.AppImage
-./nCatImage-0.6.2-x86_64.AppImage
-./nCatImage-0.6.2-x86_64.AppImage /path/to/book.cbz
+chmod +x nCatImage-0.6.3-x86_64.AppImage
+./nCatImage-0.6.3-x86_64.AppImage
+./nCatImage-0.6.3-x86_64.AppImage /path/to/book.cbz
 ```
 
 - 대상: **Linux x86_64, glibc 2.39 이상**(Ubuntu 24.04 및 동급 이상 환경).
@@ -89,7 +94,7 @@ chmod +x nCatImage-0.6.2-x86_64.AppImage
 FUSE 관련 오류가 나면 설치 없이 압축 해제 실행을 시도하세요:
 
 ```bash
-./nCatImage-0.5.1-x86_64.AppImage --appimage-extract-and-run
+./nCatImage-0.6.3-x86_64.AppImage --appimage-extract-and-run
 ```
 
 다운로드 파일의 무결성은 릴리스에 함께 제공하는 `SHA256SUMS`로 확인할 수 있습니다:

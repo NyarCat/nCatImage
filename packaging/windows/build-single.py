@@ -14,7 +14,7 @@ TARGET = "x86_64-pc-windows-gnullvm"
 SYSTEM_DLLS = {
     "kernel32.dll", "ntdll.dll", "user32.dll", "gdi32.dll", "advapi32.dll",
     "bcrypt.dll", "bcryptprimitives.dll", "ws2_32.dll", "ucrtbase.dll", "msvcrt.dll", "dbghelp.dll",
-    "ole32.dll", "combase.dll", "shell32.dll", "comdlg32.dll", "comctl32.dll", "dwmapi.dll",
+    "ole32.dll", "oleaut32.dll", "combase.dll", "shell32.dll", "comdlg32.dll", "comctl32.dll", "dwmapi.dll",
 }
 
 

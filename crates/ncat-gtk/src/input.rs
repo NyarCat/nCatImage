@@ -28,6 +28,7 @@ pub fn key(key: gdk::Key) -> Key {
         gdk::Key::r | gdk::Key::R => Key::Rotate,
         gdk::Key::d => Key::Direction,
         gdk::Key::F5 => Key::Reload,
+        gdk::Key::Delete | gdk::Key::KP_Delete => Key::Delete,
         _ => Key::Other,
     }
 }

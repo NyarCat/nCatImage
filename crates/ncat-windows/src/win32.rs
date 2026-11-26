@@ -1,6 +1,6 @@
 //! Win32 boundary: HWNDs stay on the UI thread, callbacks borrow through RefCell
 //! to tolerate synchronous control notifications. Pixel staging runs off-thread.
-use ncat_backend::{Backend, BackendOptions, Book, Event, Frame, View, WorkerCommand};
+use ncat_backend::{Backend, BackendOptions, Book, Deletion, Event, Frame, View, WorkerCommand};
 use ncat_presentation::{
     ReaderView, adjacent,
     input::{self, Command, Key, Modifiers},
@@ -253,6 +253,8 @@ struct App {
     frame: Option<Display>,
     selected: usize,
     page_loading: bool,
+    skip_delete_confirmation: bool,
+    deletion: Option<mpsc::Receiver<TrashResult>>,
     status: String,
     last_title: RefCell<String>,
     reader: ReaderView,
@@ -406,6 +408,8 @@ impl App {
                 frame: None,
                 selected: 0,
                 page_loading: false,
+                skip_delete_confirmation: false,
+                deletion: None,
                 status: "우클릭: 열기".into(),
                 last_title: RefCell::new(String::new()),
                 reader: ReaderView::default(),
@@ -602,7 +606,7 @@ impl App {
             let next = [Bar::Top, Bar::Bottom]
                 .map(|bar| !self.live_sizing && self.bars.visible(bar, editing));
             let animation = next[Bar::Bottom as usize] && self.playback.active;
-            let info = !self.live_sizing;
+            let info = next[Bar::Top as usize];
             let changed = next != self.visible_bars
                 || animation != self.visible_animation
                 || info != self.visible_info;
@@ -848,6 +852,15 @@ impl App {
                                 || left + width + 12 != self.viewport().right
                         })
                 {
+                    return false;
+                }
+                self.bars.point(None, 0, 0, 0, 0);
+                self.bars.toggle_both();
+                self.sync_pins();
+                let followed_top = !visible(self.control(METADATA)) && visible(self.metadata_hwnd);
+                self.bars.toggle_both();
+                self.sync_pins();
+                if !followed_top || !visible(self.control(METADATA)) {
                     return false;
                 }
                 self.live_sizing = true;
@@ -1202,6 +1215,106 @@ impl App {
                 Err(code) => self.set_status(&code.to_string()),
             }
             self.navigation_ui();
+        }
+    }
+
+    unsafe fn delete_page(&mut self) {
+        if self.frame.is_none() || self.page_loading || self.deletion.is_some() {
+            return;
+        }
+        let target = self
+            .book
+            .as_ref()
+            .filter(|book| book.complete)
+            .and_then(|book| book.deletion(self.selected));
+        // SAFETY: dialogs belong to this UI thread; the target is owned.
+        unsafe {
+            let (path, name, next) = match target {
+                Some(Deletion::File { path, name, next }) => (path, name, next),
+                Some(Deletion::Archive) => {
+                    MessageBoxW(
+                        self.hwnd,
+                        windows_sys::core::w!("압축 파일이라 삭제 불가능합니다"),
+                        windows_sys::core::w!("삭제 불가"),
+                        MB_OK | MB_ICONWARNING,
+                    );
+                    return;
+                }
+                None => return,
+            };
+            if !self.skip_delete_confirmation {
+                let Some(skip) = confirm_deletion(self.hwnd, &name) else {
+                    return;
+                };
+                self.skip_delete_confirmation = skip;
+            }
+            let (send, receive) = mpsc::channel();
+            let owner = self.hwnd as usize;
+            let alive = self.stop.clone();
+            let job = std::thread::Builder::new()
+                .name("ncat-recycle".into())
+                .spawn(move || {
+                    let ok = recycle_file(&path);
+                    if send.send(TrashResult { path, next, ok }).is_ok()
+                        && !alive.load(Ordering::Acquire)
+                    {
+                        PostMessageW(owner as HWND, RESULT, 0, 0);
+                    }
+                });
+            if job.is_ok() {
+                self.deletion = Some(receive);
+            } else {
+                self.set_status("이미지를 휴지통으로 이동할 수 없습니다");
+            }
+        }
+    }
+
+    unsafe fn consume_deletion(&mut self) {
+        let Some(rx) = &self.deletion else { return };
+        let result = match rx.try_recv() {
+            Ok(result) => result,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.deletion = None;
+                return;
+            }
+        };
+        self.deletion = None;
+        if self.closing.is_some() {
+            return;
+        }
+        // SAFETY: this consumes the result on the same UI thread as the viewer.
+        unsafe {
+            if !result.ok {
+                MessageBoxW(
+                    self.hwnd,
+                    windows_sys::core::w!("이미지를 휴지통으로 이동할 수 없습니다"),
+                    windows_sys::core::w!("삭제 불가"),
+                    MB_OK | MB_ICONWARNING,
+                );
+                return;
+            }
+            let reopen = self
+                .book
+                .as_ref()
+                .and_then(|book| book.after_deletion(self.selected, &result.path, result.next));
+            match reopen {
+                Some(Some(path)) => self.open(path),
+                Some(None) => {
+                    self.backend.cancel();
+                    self.book = None;
+                    self.frame = None;
+                    self.selected = 0;
+                    self.page_loading = false;
+                    self.metadata.clear();
+                    self.sync_metadata();
+                    self.reset(true);
+                    self.set_status("이미지를 휴지통으로 이동했습니다");
+                    self.navigation_ui();
+                    self.invalidate_picture();
+                }
+                None => {}
+            }
         }
     }
     unsafe fn navigate(&mut self, forward: bool) {
@@ -1642,6 +1755,7 @@ impl App {
                 VK_OEM_PLUS | VK_ADD => Key::ZoomIn,
                 VK_OEM_MINUS | VK_SUBTRACT => Key::ZoomOut,
                 VK_F5 => Key::Reload,
+                VK_DELETE => Key::Delete,
                 0x4f => Key::Open,
                 0x4c => Key::Network,
                 0x51 => Key::Quit,
@@ -1657,6 +1771,7 @@ impl App {
             ) {
                 Command::Native => return false,
                 Command::Block => {}
+                Command::Delete => self.delete_page(),
                 Command::ToggleMetadata => {
                     self.toggle_metadata();
                 }
@@ -2170,6 +2285,197 @@ unsafe fn open_menu(hwnd: HWND, location: LPARAM) -> Option<u16> {
     }
 }
 
+struct TrashResult {
+    path: PathBuf,
+    next: Option<PathBuf>,
+    ok: bool,
+}
+
+fn recycle_file(path: &std::path::Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::Win32::{
+        System::Com::CoCreateInstance,
+        UI::Shell::{
+            FOF_ALLOWUNDO, FOF_NO_CONNECTED_ELEMENTS, FOF_NOCONFIRMATION, FOF_NOERRORUI,
+            FOF_NORECURSION, FOF_SILENT, FOFX_EARLYFAILURE, FOFX_RECYCLEONDELETE, FileOperation,
+            IFileOperation, IShellItem, SHCreateItemFromParsingName,
+        },
+    };
+    let Ok(path) = std::path::absolute(path) else {
+        return false;
+    };
+    if !std::fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.is_file()) {
+        return false;
+    }
+    let name: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: this task owns its COM apartment and its path buffer. Shell
+    // operations are restricted to a single file with the recycle-only flag.
+    unsafe {
+        if CoInitializeEx(ptr::null(), COINIT_APARTMENTTHREADED as u32) < 0 {
+            return false;
+        }
+        let result = (|| -> windows::core::Result<bool> {
+            let operation: IFileOperation = CoCreateInstance(
+                &FileOperation,
+                None,
+                windows::Win32::System::Com::CLSCTX_INPROC_SERVER,
+            )?;
+            operation.SetOperationFlags(
+                FOFX_RECYCLEONDELETE
+                    | FOF_ALLOWUNDO
+                    | FOF_NOCONFIRMATION
+                    | FOF_NORECURSION
+                    | FOF_NO_CONNECTED_ELEMENTS
+                    | FOF_NOERRORUI
+                    | FOFX_EARLYFAILURE
+                    | FOF_SILENT,
+            )?;
+            let item: IShellItem =
+                SHCreateItemFromParsingName(windows::core::PCWSTR(name.as_ptr()), None)?;
+            operation.DeleteItem(&item, None)?;
+            operation.PerformOperations()?;
+            Ok(!operation.GetAnyOperationsAborted()?.as_bool())
+        })();
+        CoUninitialize();
+        result.unwrap_or(false) && path.try_exists().is_ok_and(|exists| !exists)
+    }
+}
+
+unsafe fn confirm_deletion(owner: HWND, name: &str) -> Option<bool> {
+    use windows_sys::core::w;
+    #[repr(C, align(4))]
+    struct Template {
+        dialog: DLGTEMPLATE,
+        menu: u16,
+        class: u16,
+        title: u16,
+    }
+    const SKIP: i32 = 701;
+    let template = Template {
+        dialog: DLGTEMPLATE {
+            style: WS_POPUP | WS_CAPTION | WS_SYSMENU | DS_MODALFRAME as u32 | DS_CENTER as u32,
+            cdit: 0,
+            cx: 255,
+            cy: 94,
+            ..Default::default()
+        },
+        menu: 0,
+        class: 0,
+        title: 0,
+    };
+    unsafe extern "system" fn callback(
+        hwnd: HWND,
+        msg: u32,
+        wparam: WPARAM,
+        lparam: LPARAM,
+    ) -> isize {
+        // SAFETY: in the synchronous dialog call, the input buffer is live and
+        // child controls are owned by the current GUI thread.
+        unsafe {
+            match msg {
+                WM_INITDIALOG => {
+                    SetWindowTextW(hwnd, w!("삭제하시겠습니까?"));
+                    let mut client = RECT::default();
+                    GetClientRect(hwnd, &mut client);
+                    let instance = GetModuleHandleW(ptr::null());
+                    let font = GetStockObject(DEFAULT_GUI_FONT) as usize;
+                    for (class, text, style, id, x, y, width, height) in [
+                        (
+                            w!("STATIC"),
+                            lparam as *const u16,
+                            windows_sys::Win32::System::SystemServices::SS_NOPREFIX,
+                            0,
+                            12,
+                            12,
+                            client.right - 24,
+                            client.bottom - 74,
+                        ),
+                        (
+                            w!("BUTTON"),
+                            w!("다시 묻지 않기"),
+                            WS_TABSTOP | BS_AUTOCHECKBOX as u32,
+                            SKIP,
+                            12,
+                            client.bottom - 62,
+                            client.right - 24,
+                            24,
+                        ),
+                        (
+                            w!("BUTTON"),
+                            w!("취소"),
+                            WS_TABSTOP | BS_DEFPUSHBUTTON as u32,
+                            IDCANCEL,
+                            client.right - 160,
+                            client.bottom - 34,
+                            72,
+                            26,
+                        ),
+                        (
+                            w!("BUTTON"),
+                            w!("삭제"),
+                            WS_TABSTOP | BS_PUSHBUTTON as u32,
+                            IDOK,
+                            client.right - 80,
+                            client.bottom - 34,
+                            72,
+                            26,
+                        ),
+                    ] {
+                        let child = CreateWindowExW(
+                            0,
+                            class,
+                            text,
+                            WS_CHILD | WS_VISIBLE | style,
+                            x,
+                            y,
+                            width,
+                            height,
+                            hwnd,
+                            id as usize as _,
+                            instance,
+                            ptr::null(),
+                        );
+                        if child.is_null() {
+                            EndDialog(hwnd, 0);
+                            return 1;
+                        }
+                        SendMessageW(child, WM_SETFONT, font, 1);
+                    }
+                    SendMessageW(hwnd, DM_SETDEFID, IDCANCEL as usize, 0);
+                    SetFocus(GetDlgItem(hwnd, IDCANCEL));
+                    0
+                }
+                WM_CLOSE | WM_COMMAND if msg == WM_CLOSE || wparam as u16 as i32 == IDCANCEL => {
+                    EndDialog(hwnd, 0);
+                    1
+                }
+                WM_COMMAND if wparam as u16 as i32 == IDOK => {
+                    let checked = SendMessageW(GetDlgItem(hwnd, SKIP), BM_GETCHECK, 0, 0) == 1;
+                    EndDialog(hwnd, if checked { 2 } else { 1 });
+                    1
+                }
+                _ => 0,
+            }
+        }
+    }
+    let message = wide(&format!("{name}\r\n휴지통으로 이동합니다."));
+    // SAFETY: the aligned template and NUL-terminated message are stack-owned
+    // and remain alive until the modal call completes.
+    match unsafe {
+        DialogBoxIndirectParamW(
+            GetModuleHandleW(ptr::null()),
+            &raw const template.dialog,
+            owner,
+            Some(callback),
+            message.as_ptr() as LPARAM,
+        )
+    } {
+        1 => Some(false),
+        2 => Some(true),
+        _ => None,
+    }
+}
+
 unsafe fn log_dialog(owner: HWND, log: &str) {
     use windows_sys::core::w;
     #[repr(C, align(4))]
@@ -2519,6 +2825,7 @@ unsafe fn draw_glass_button(item: &windows_sys::Win32::UI::Controls::DRAWITEMSTR
         let glyph = match item.CtlID as u16 {
             PREVIOUS => "←",
             NEXT => "→",
+            PAGE_GO => "▾",
             FIT => "⊡",
             ROTATE => "↻",
             FULLSCREEN => "⛶",
@@ -2597,6 +2904,7 @@ unsafe fn attach_tooltips(
             let label = match id {
                 PREVIOUS => w!("이전 페이지"),
                 NEXT => w!("다음 페이지"),
+                PAGE_GO => w!("페이지 이동"),
                 SMALLER => w!("축소"),
                 LARGER => w!("확대"),
                 FIT => w!("맞춤"),
@@ -3250,7 +3558,7 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
                 let specs = [
                     (PREVIOUS, "BUTTON", "이전 페이지", 8, 8, 36),
                     (PAGE, "EDIT", "1", 48, 8, 52),
-                    (PAGE_GO, "BUTTON", "이동", 104, 8, 46),
+                    (PAGE_GO, "BUTTON", "페이지 이동", 104, 8, 46),
                     (NEXT, "BUTTON", "다음 페이지", 154, 8, 36),
                     (DIRECTION, "BUTTON", "좌→우", 194, 8, 60),
                     (TOP_PIN, "BUTTON", "고정 해제", 258, 8, 40),
@@ -3432,6 +3740,7 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
             loop {
                 {
                     let mut app = state.borrow_mut();
+                    app.consume_deletion();
                     // Check the queue itself before blocking, even if a nested
                     // message loop already removed the only RESULT wake.
                     while let Ok(event) = app.events.try_recv() {
@@ -3455,7 +3764,12 @@ pub fn run(initial: Option<PathBuf>, smoke: Smoke) -> io::Result<()> {
                         .borrow_mut()
                         .track_bars(message.hwnd, message.message == WM_MOUSELEAVE);
                 }
-                if message.message == WM_KEYDOWN && state.borrow_mut().key(message.wParam as u32) {
+                let repeated_delete =
+                    message.wParam as u16 == VK_DELETE && message.lParam & (1 << 30) != 0;
+                if message.message == WM_KEYDOWN
+                    && !repeated_delete
+                    && state.borrow_mut().key(message.wParam as u32)
+                {
                     continue;
                 }
                 let controls_input = state.borrow().controls_input;
